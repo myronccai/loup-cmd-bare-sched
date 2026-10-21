@@ -1,0 +1,26 @@
+@mode(freestanding)
+
+# The scheduler kernel's entry on aarch64: attach the console, build the
+# board, hand over to the demo.
+#
+# Runtime: freestanding, aarch64 only. The entry file of
+# boards/aarch64/package.lppkg: `make build` compiles it, with the modules
+# it imports, into the bare-metal image build/sched-aarch64.elf (`loup
+# build --target freestanding --arch aarch64 boards/aarch64`); there is no
+# operating system, runtime library, heap or exceptions. `make boot` boots
+# it on QEMU's virt machine (scripts/qemu.sh), waits for the demo, types
+# keys and compares the transcripts with tests/expected/; `make run
+# ARCH=aarch64` boots it on this terminal. `make check` type-checks it with
+# Stage0 from boards/aarch64.
+
+from kernel.console import (attach);
+from arm.pl011 import (pl011Put);
+from arm.board import (virtBoard);
+from demo.run import (runKernel);
+
+# _start (arm/board.lpfree) calls it by name, on the boot stack, at EL1
+# with interrupts masked.
+func kernelMain(): void {
+    attach(pl011Put);
+    runKernel(virtBoard());
+}

@@ -1,0 +1,284 @@
+@mode(freestanding)
+
+# The task table: what each task is, what state it is in, and where its
+# stack is. The scheduler (kernel/sched.lpfree) is the only module that
+# changes it.
+#
+# Runtime: freestanding, shared by all four images. `make build` compiles
+# it into each with `loup build --target freestanding`: no operating
+# system, runtime library, heap or exceptions. It runs when `make boot`
+# boots the images under QEMU; the self-test images check the state
+# encoding and the stack guards. `make check` type-checks it with Stage0.
+#
+# Structure: the limits and priorities; TaskState, the typed view of a
+# task's state; the table itself, one buffer per column; the state
+# encoding with its integer form for interrupt context; then the stacks
+# and their guards.
+
+pub const MAX_TASKS: int = 8;
+
+# Task 0 is the boot context: it runs the kernel's start-up on the boot
+# stack, then idles whenever nothing else is ready.
+pub const IDLE_TASK: int = 0;
+
+# A ready task of a higher priority always runs before one of a lower
+# priority. Tasks of the same priority take turns, and only give up the
+# CPU when they block, sleep, yield or end. The timer interrupt takes it
+# from a lower-priority task as soon as a higher-priority one is ready.
+pub const PRIO_IDLE: uint64 = 0u64;
+pub const PRIO_BACKGROUND: uint64 = 1u64;
+pub const PRIO_NORMAL: uint64 = 2u64;
+
+# ---- The typed state --------------------------------------------------------
+
+## What a blocked task waits for.
+pub enum Wait {
+    Semaphore(uint64),
+    Mutex(uint64),
+    Input,
+}
+
+## A task's state. It is generic in what a blocked task waits for: the
+## scheduler moves tasks in and out of Blocked without looking at the
+## reason, which belongs to the synchronization layer (Wait above).
+pub enum TaskState[W] {
+    Ready,
+    Running,
+    Sleeping(uint64),
+    Blocked(W),
+    Done,
+}
+
+# ---- The table ---------------------------------------------------------------
+
+# The state of each task as a code and an argument (the wake-up tick, or the
+# id of the semaphore or mutex). A buffer of enum values would hold
+# references in a 1.26.0 freestanding build, like a buffer of structs, so
+# the table keeps integers and stateOf/setState translate.
+pub const CODE_READY: uint64 = 0u64;
+pub const CODE_RUNNING: uint64 = 1u64;
+pub const CODE_SLEEPING: uint64 = 2u64;
+pub const CODE_SEMAPHORE: uint64 = 3u64;
+pub const CODE_MUTEX: uint64 = 4u64;
+pub const CODE_INPUT: uint64 = 5u64;
+pub const CODE_DONE: uint64 = 6u64;
+
+var used: int = 0;
+var names: buffer[string, 8];
+var priorities: buffer[uint64, 8];
+var codes: buffer[uint64, 8];
+var codeArgs: buffer[uint64, 8];
+var entries: buffer[fn(uint64): void, 8];
+var entryArgs: buffer[uint64, 8];
+# How many times each task has been given the CPU.
+var runCounts: buffer[uint64, 8];
+# When each blocked task started waiting, as a sequence number: the
+# longest waiter is woken first.
+var waitSince: buffer[uint64, 8];
+var waitSeq: uint64 = 0u64;
+
+## Adds a row; the caller has checked there is room. Returns the new id.
+pub func addRow(name: string, priority: uint64, entry: fn(uint64): void, arg: uint64): int {
+    let id = used;
+    names[id] = name;
+    priorities[id] = priority;
+    codes[id] = CODE_READY;
+    codeArgs[id] = 0u64;
+    entries[id] = entry;
+    entryArgs[id] = arg;
+    runCounts[id] = 0u64;
+    waitSince[id] = 0u64;
+    used += 1;
+    return id;
+}
+
+@interruptSafe
+pub func taskCount(): int {
+    return used;
+}
+
+pub func nameOf(id: int): string {
+    return names[id];
+}
+
+@interruptSafe
+pub func priorityOf(id: int): uint64 {
+    return priorities[id];
+}
+
+pub func entryOf(id: int): fn(uint64): void {
+    return entries[id];
+}
+
+pub func entryArgOf(id: int): uint64 {
+    return entryArgs[id];
+}
+
+@interruptSafe
+pub func countRun(id: int): void {
+    runCounts[id] += 1u64;
+}
+
+pub func runsOf(id: int): uint64 {
+    return runCounts[id];
+}
+
+# ---- The state, as integers (interrupt context) and as TaskState --------------
+
+@interruptSafe
+pub func codeOf(id: int): uint64 {
+    return codes[id];
+}
+
+@interruptSafe
+pub func codeArgOf(id: int): uint64 {
+    return codeArgs[id];
+}
+
+@interruptSafe
+pub func setCode(id: int, code: uint64, arg: uint64): void {
+    codes[id] = code;
+    codeArgs[id] = arg;
+}
+
+## The blocked task that has waited longest for `code` with `arg` (the
+## same semaphore, the same mutex), or -1 when none waits.
+@interruptSafe
+pub func longestWaiter(code: uint64, arg: uint64): int {
+    var found = -1;
+    var id = 0;
+    while (id < used) {
+        if (codes[id] == code and codeArgs[id] == arg) {
+            if (found < 0 or waitSince[id] < waitSince[found]) {
+                found = id;
+            }
+        }
+        id += 1;
+    }
+    return found;
+}
+
+pub func stateOf(id: int): TaskState[Wait] {
+    let code = codes[id];
+    let arg = codeArgs[id];
+    if (code == CODE_RUNNING) {
+        return TaskState.Running;
+    } else if (code == CODE_SLEEPING) {
+        return TaskState.Sleeping(arg);
+    } else if (code == CODE_SEMAPHORE) {
+        return TaskState.Blocked(Wait.Semaphore(arg));
+    } else if (code == CODE_MUTEX) {
+        return TaskState.Blocked(Wait.Mutex(arg));
+    } else if (code == CODE_INPUT) {
+        return TaskState.Blocked(Wait.Input);
+    } else if (code == CODE_DONE) {
+        return TaskState.Done;
+    }
+    return TaskState.Ready;
+}
+
+## Records `s` as task `id`'s state. A task entering Blocked is stamped
+## with the next wait sequence number, for longestWaiter.
+pub func setState(id: int, s: TaskState[Wait]): void {
+    match s {
+        TaskState.Ready => { setCode(id, CODE_READY, 0u64); },
+        TaskState.Running => { setCode(id, CODE_RUNNING, 0u64); },
+        TaskState.Sleeping(until) => { setCode(id, CODE_SLEEPING, until); },
+        TaskState.Blocked(w) => {
+            waitSeq += 1u64;
+            waitSince[id] = waitSeq;
+            match w {
+                Wait.Semaphore(sem) => { setCode(id, CODE_SEMAPHORE, sem); },
+                Wait.Mutex(m) => { setCode(id, CODE_MUTEX, m); },
+                Wait.Input => { setCode(id, CODE_INPUT, 0u64); },
+            }
+        },
+        TaskState.Done => { setCode(id, CODE_DONE, 0u64); },
+    }
+}
+
+# ---- Stacks --------------------------------------------------------------------
+
+# Every task but idle gets STACK_WORDS of stack with GUARD_WORDS of guard
+# below it, filled with GUARD_WORD. A stack grows down, so a task that
+# needs more than its stack writes into its guard first: the scheduler
+# checks the top of the guard each time the task gives up the CPU. The
+# guard is larger than the deepest frame in this kernel with an interrupt
+# on top of it, so an overflow is caught before it reaches the stack below.
+# Measured high-water marks: 4 KiB for the deepest task on x86_64 and
+# 9.5 KiB on aarch64, whose back end makes larger frames; an interrupt
+# landing on top adds up to 2 KiB (x86_64) and 5 KiB (aarch64).
+pub const STACK_WORDS: uint64 = 2048u64;
+pub const GUARD_WORDS: uint64 = 1024u64;
+const SLOT_WORDS: uint64 = STACK_WORDS + GUARD_WORDS;
+const CHECKED_GUARD_WORDS: uint64 = 8u64;
+const GUARD_WORD: uint64 = 0x4755_4152_4447_4431u64;   # "GUARDGD1" in ASCII
+
+# The stack area: (MAX_TASKS - 1) slots, since idle has the boot stack.
+# makeBufferU64 only takes a literal, so the compiler checks the literal
+# against the layout: if a constant above changes, the build stops here.
+const func slotsTimesWords(literal: uint64, slots: uint64, words: uint64): uint64 {
+    let needed = slots * words;
+    if (literal != needed) {
+        unreachable;
+    }
+    return literal;
+}
+
+const STACK_AREA_WORDS: uint64 = slotsTimesWords(21504u64, 7u64, SLOT_WORDS);
+
+# Reserved on first use: raw memory that only the context switch and the
+# guard checks touch, by address.
+var stackArea: uint64 = 0u64;
+
+func reserveStacks(): uint64 {
+    if (stackArea == 0u64) {
+        stackArea = makeBufferU64(21504);
+    }
+    return stackArea;
+}
+
+## The address of the lowest word of task `id`'s slot (its guard).
+func slotBase(id: int): uint64 {
+    let slot = (id - 1) as uint64;
+    return reserveStacks() + slot * SLOT_WORDS * 8u64;
+}
+
+## The address just above task `id`'s stack, where its first frame goes.
+pub func stackTopOf(id: int): uint64 {
+    return slotBase(id) + SLOT_WORDS * 8u64;
+}
+
+pub func stackBytes(): uint64 {
+    return STACK_WORDS * 8u64;
+}
+
+## Fills task `id`'s guard with the guard pattern.
+@unsafe("raw stack memory: writes the guard words of a slot reserved by makeBufferU64")
+pub func armGuard(id: int): void {
+    let base = slotBase(id);
+    var i: uint64 = 0u64;
+    while (i < GUARD_WORDS) {
+        bufSetU64(base, i as int, GUARD_WORD);
+        i += 1u64;
+    }
+}
+
+## True while the top of task `id`'s guard still holds the pattern. Idle
+## runs on the boot stack, which has no guard.
+@interruptSafe
+@unsafe("raw stack memory: reads the guard words of a slot reserved by makeBufferU64")
+pub func guardIntact(id: int): bool {
+    if (id == IDLE_TASK) {
+        return true;
+    }
+    let base = stackArea + ((id - 1) as uint64) * SLOT_WORDS * 8u64;
+    var i: uint64 = GUARD_WORDS - CHECKED_GUARD_WORDS;
+    while (i < GUARD_WORDS) {
+        if (bufGetU64(base, i as int) != GUARD_WORD) {
+            return false;
+        }
+        i += 1u64;
+    }
+    return true;
+}

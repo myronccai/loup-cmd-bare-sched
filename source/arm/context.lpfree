@@ -1,0 +1,162 @@
+@mode(freestanding)
+
+# Switching between tasks on aarch64: the context switch, the entry a new
+# task starts at, and the frame that leads a new task there.
+#
+# Runtime: freestanding, aarch64 only. The arm board module imports it, so
+# `make build` compiles it into build/sched-aarch64.elf and
+# build/selftest-aarch64.elf (`loup build --target freestanding --arch
+# aarch64 boards/...`); the x86_64 images never contain it. It runs when
+# `make boot` boots those images on QEMU's virt machine (Cortex-A53);
+# `make check` type-checks it with Stage0 from boards/aarch64.
+#
+# As on x86_64, a task that is not running is its stack pointer, and the
+# switch is an ordinary call to its caller: it keeps only what AAPCS64
+# says a call preserves, x19-x28, the frame pointer x29, the link register
+# x30 (where the task resumes) and sp. The low halves of v8-v15 are
+# preserved too in the ABI, but this kernel's code never touches the
+# floating-point registers, so they are not saved.
+
+## The frame switchContext leaves on a stack, lowest address first: the
+## registers in the order it stores them, in pairs. AAPCS64 keeps sp
+## 16-byte aligned, and the frame is always at sp, hence @align.
+@align(16)
+@repr(C)
+struct SwitchFrame {
+    var x19: uint64;
+    var x20: uint64;
+    var x21: uint64;
+    var x22: uint64;
+    var x23: uint64;
+    var x24: uint64;
+    var x25: uint64;
+    var x26: uint64;
+    var x27: uint64;
+    var x28: uint64;
+    var x29: uint64;
+    var x30: uint64;
+}
+
+## `actual` when it equals `expected`, evaluated by the compiler: if the
+## frame and the stores below disagree, the build fails.
+const func checked(actual: uint64, expected: uint64): uint64 {
+    if (actual != expected) {
+        unreachable;
+    }
+    return actual;
+}
+
+const FRAME_BYTES = checked(size_of[SwitchFrame](), 96u64);
+const FRAME_ALIGN = checked(align_of[SwitchFrame](), 16u64);
+
+## switchContext(saveSpAt, nextSp): saves the running task and resumes
+## another. The arguments arrive in x0 and x1 as AAPCS64 says; a naked
+## function has no prologue to move them, so the assembly reads the
+## registers, and @callconv makes the convention part of the declaration.
+## Called with interrupts masked (from dispatch in kernel/sched.lpfree).
+@naked
+@callconv("aapcs64")
+@interruptSafe
+@unsafe("naked: replaces sp; saves and restores the AAPCS64 callee-saved registers on the two task stacks")
+@section(".text.switch")
+pub func switchContext(saveSpAt: uint64, nextSp: uint64): void {
+    asm {
+        # Make room for a SwitchFrame on the running task's stack (sp
+        # stays 16-byte aligned) and store the preserved registers in it.
+        # x30 holds the return address: where this task resumes.
+        "sub sp, sp, #96"
+        "stp x19, x20, [sp, #0]"
+        "stp x21, x22, [sp, #16]"
+        "stp x23, x24, [sp, #32]"
+        "stp x25, x26, [sp, #48]"
+        "stp x27, x28, [sp, #64]"
+        "stp x29, x30, [sp, #80]"
+        # Store the frame's address for the scheduler. sp cannot be the
+        # source of a store, so it goes through x9, which a call may
+        # clobber anyway.
+        "mov x9, sp"
+        "str x9, [x0]"
+        # Take the other task's stack, which ends in its SwitchFrame.
+        "mov sp, x1"
+        # Restore its registers and drop the frame ...
+        "ldp x19, x20, [sp, #0]"
+        "ldp x21, x22, [sp, #16]"
+        "ldp x23, x24, [sp, #32]"
+        "ldp x25, x26, [sp, #48]"
+        "ldp x27, x28, [sp, #64]"
+        "ldp x29, x30, [sp, #80]"
+        "add sp, sp, #96"
+        # ... and return to where it called switchContext: or, for a new
+        # task, to taskEntry.
+        "ret"
+    }
+}
+
+## Where a new task's first switch returns to: the frame newTaskFrame built
+## holds the task id in x19. Interrupts are still masked from the switch.
+@naked
+@callconv("aapcs64")
+@unsafe("naked: runs with the frame newTaskFrame built; never returns")
+@section(".text.switch")
+func taskEntry(): void {
+    asm {
+        # Every task runs with IRQs unmasked (DAIF.I, bit 1 of the field).
+        "msr daifclr, #2"
+        # taskStart(id): the first argument goes in x0.
+        "mov x0, x19"
+        "bl taskStart"
+        # taskStart ends the task and never returns: an undefined
+        # instruction (udf #0) traps if it ever does.
+        ".inst 0x00000000"
+    }
+}
+
+func taskEntryAddress(): uint64 {
+    var a: uint64 = 0u64;
+    asm {
+        "adrp x0, taskEntry"
+        "add x0, x0, :lo12:taskEntry"
+        out: a = "=x0"
+        clobbers: []
+    }
+    return a;
+}
+
+## Builds a new task's first SwitchFrame below `stackTop` and returns the
+## stack pointer the switch resumes it from. PartialInit makes the compiler
+## check that every register gets a value: a frame with a field left out
+## would start the task with whatever the stack held.
+@unsafe("raw stack memory: writes the first frame into a task's stack, reserved by makeBufferU64")
+pub func newTaskFrame(stackTop: uint64, taskId: uint64): uint64 {
+    var f = PartialInit[SwitchFrame].begin();
+    f.set(.x19, taskId);
+    f.set(.x20, 0u64);
+    f.set(.x21, 0u64);
+    f.set(.x22, 0u64);
+    f.set(.x23, 0u64);
+    f.set(.x24, 0u64);
+    f.set(.x25, 0u64);
+    f.set(.x26, 0u64);
+    f.set(.x27, 0u64);
+    f.set(.x28, 0u64);
+    f.set(.x29, 0u64);
+    f.set(.x30, taskEntryAddress());
+    let frame = f.complete();
+    # sp must stay 16-byte aligned: the frame is 96 bytes, so the task
+    # starts with sp at the aligned top.
+    let top = stackTop - (stackTop % 16u64);
+    let sp = top - FRAME_BYTES;
+    bufSetU64(sp, 0, frame.x19);
+    bufSetU64(sp, 1, frame.x20);
+    bufSetU64(sp, 2, frame.x21);
+    bufSetU64(sp, 3, frame.x22);
+    bufSetU64(sp, 4, frame.x23);
+    bufSetU64(sp, 5, frame.x24);
+    bufSetU64(sp, 6, frame.x25);
+    bufSetU64(sp, 7, frame.x26);
+    bufSetU64(sp, 8, frame.x27);
+    bufSetU64(sp, 9, frame.x28);
+    bufSetU64(sp, 10, frame.x29);
+    bufSetU64(sp, 11, frame.x30);
+    return sp;
+}

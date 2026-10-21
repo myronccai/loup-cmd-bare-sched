@@ -1,0 +1,51 @@
+@mode(freestanding)
+
+# What the scheduler needs from a board: the operations that differ per CPU
+# and per machine. Each board module (x86/board.lpfree, arm/board.lpfree)
+# implements it with a template foundation for the CPU and an overlay for
+# the QEMU machine.
+#
+# Runtime: freestanding, shared by both scheduler images and both self-test
+# images. `make build` compiles it into each with `loup build --target
+# freestanding`: no operating system, runtime library, heap or exceptions.
+# It runs when `make boot` boots the images under QEMU; `make check`
+# type-checks it with Stage0.
+
+pub interface Platform {
+    ## The CPU, as `--arch` names it: "x86_64", "aarch64".
+    func arch(): string;
+
+    ## The machine QEMU emulates: "QEMU pc", "QEMU virt".
+    func machine(): string;
+
+    ## Installs the trap handlers, sets up the interrupt controller and the
+    ## UART's receive interrupt, and prints one line per step. Interrupts
+    ## stay masked at the CPU.
+    func bringUp(): void;
+
+    ## Starts the timer interrupt, `hz` times a second, and prints a line.
+    ## The scheduler starts it last, just before it unmasks interrupts, so
+    ## that tick 1 comes one period after the first task starts.
+    func startTimer(hz: uint64): void;
+
+    ## Unmasks interrupts at the CPU.
+    func enableInterrupts(): void;
+
+    ## Sleeps until the next interrupt.
+    func idle(): void;
+
+    ## Writes, below `stackTop`, the frame a new task starts from: the
+    ## context switch "returns" into the board's task entry, which calls
+    ## kernel.sched.taskStart(taskId). Returns the task's first stack
+    ## pointer.
+    func newTaskFrame(stackTop: uint64, taskId: uint64): uint64;
+
+    ## Saves the running task's registers on its stack, stores its stack
+    ## pointer at the address `saveSpAt`, then loads `nextSp` and resumes
+    ## the task that saved it. Called with interrupts masked; returns when
+    ## the saved task is resumed in its turn.
+    func switchStacks(saveSpAt: uint64, nextSp: uint64): void;
+
+    ## Stops the machine: QEMU exits with the board's form of `status`.
+    func halt(status: uint8): void;
+}

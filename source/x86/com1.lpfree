@@ -1,0 +1,62 @@
+@mode(freestanding)
+
+# COM1, the PC's first serial port (a 16550 UART at I/O port 0x3F8): the
+# console. Output is polled; input raises IRQ 4 for every byte received.
+#
+# Runtime: freestanding, x86_64 only. The x86 board module imports it, so
+# `make build` compiles it into build/sched-x86_64.elf and
+# build/selftest-x86_64.elf (`loup build --target freestanding --arch
+# x86_64`); the aarch64 images never contain it. It runs when `make boot`
+# boots those images on QEMU's pc machine; `make check` type-checks it with
+# Stage0.
+
+from x86.ports import (outb, inb);
+
+const BASE: uint16 = 0x3F8u16;
+
+# Register offsets from BASE. With the divisor latch bit (DLAB) set in the
+# line control register, offsets 0 and 1 are the baud divisor instead.
+const DATA: uint16 = 0u16;
+const INTERRUPTS: uint16 = 1u16;
+const LINE_CONTROL: uint16 = 3u16;
+const MODEM_CONTROL: uint16 = 4u16;
+const LINE_STATUS: uint16 = 5u16;
+
+const STATUS_RECEIVED: uint8 = 0x01u8;
+const STATUS_TX_EMPTY: uint8 = 0x20u8;
+
+## 115200 baud, 8 data bits, no parity, 1 stop bit; no interrupts yet.
+pub func com1Init(): void {
+    outb(BASE + INTERRUPTS, 0x00u8);
+    outb(BASE + LINE_CONTROL, 0x80u8);   # DLAB on
+    outb(BASE + DATA, 0x01u8);           # divisor 1 = 115200 baud (low byte)
+    outb(BASE + INTERRUPTS, 0x00u8);     # (high byte)
+    outb(BASE + LINE_CONTROL, 0x03u8);   # DLAB off; 8N1
+}
+
+## Turns on the "byte received" interrupt. OUT2 in the modem control
+## register gates the UART's interrupt line to the 8259 on a PC; DTR and
+## RTS tell the other end we are there. The FIFOs are left as they are:
+## resetting them would drop keys that have already arrived.
+pub func com1EnableReceive(): void {
+    outb(BASE + MODEM_CONTROL, 0x0Bu8);
+    outb(BASE + INTERRUPTS, 0x01u8);
+}
+
+## Writes one byte, waiting until the transmitter can take it.
+pub func com1Put(c: uint8): void {
+    while ((inb(BASE + LINE_STATUS) & STATUS_TX_EMPTY) == 0u8) {
+    }
+    outb(BASE + DATA, c);
+}
+
+@interruptSafe
+pub func com1HasByte(): bool {
+    return (inb(BASE + LINE_STATUS) & STATUS_RECEIVED) != 0u8;
+}
+
+## The next received byte; reading it also clears the receive interrupt.
+@interruptSafe
+pub func com1Take(): uint8 {
+    return inb(BASE + DATA);
+}

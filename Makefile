@@ -1,46 +1,61 @@
-# Build, check and test commands for this Loup command-line application.
+# Check, build and boot the bare-metal images of loup-cmd-bare-sched.
 #
-# On Linux x86-64 `loup` is the self-hosted driver and `loup-bootstrap` is
-# Stage0; `check` and `test` need Stage0 there. On macOS, Windows and Linux
-# arm64 both names run Stage0, so these targets work unchanged.
+# Four images: the scheduler and the self-test, each for x86_64 (QEMU pc)
+# and aarch64 (QEMU virt). The x86_64 scheduler's manifest is package.lppkg
+# at the root; the others are under boards/. On Linux x86-64 `loup` is the
+# self-hosted driver, which builds images; `loup-bootstrap` (Stage0)
+# type-checks them.
 
-APP            ?= myapp
 LOUP           ?= loup
 LOUP_BOOTSTRAP ?= loup-bootstrap
 BUILD_DIR      ?= build
-BIN            := $(BUILD_DIR)/$(APP)
-SOURCES        := package.lppkg $(shell find source -name '*.loup')
-ARGS           ?=
-TEST_ARGS      ?=
+ARCH           ?= x86_64
+IMAGES         := $(BUILD_DIR)/sched-x86_64.elf $(BUILD_DIR)/sched-aarch64.elf \
+                  $(BUILD_DIR)/selftest-x86_64.elf $(BUILD_DIR)/selftest-aarch64.elf
+BOARDS         := boards/aarch64 boards/selftest-x86_64 boards/selftest-aarch64
+SOURCES        := package.lppkg $(wildcard boards/*/package.lppkg) \
+                  $(wildcard linker/*.ld) $(shell find source -name '*.lpfree')
 
-.PHONY: all run check test build ci clean
+# The directory holding an image's manifest: build/IMAGE-ARCH.elf comes
+# from boards/IMAGE-ARCH, except the x86_64 scheduler (the root) and the
+# aarch64 one (boards/aarch64).
+manifest_dir = $(if $(filter sched-x86_64,$(1)),.,$(if $(filter sched-aarch64,$(1)),boards/aarch64,boards/$(1)))
+arch_of = $(lastword $(subst -, ,$(1)))
+
+.PHONY: all check build boot run ci clean
 
 all: build
 
-# Run from source, e.g. `make run ARGS="hello Ann --shout"`.
-run:
-	$(LOUP) run source/main.loup -- $(ARGS)
-
-# Type-check source/main.loup and every module it imports.
+# Type-check every image's entry file and the modules it imports. Each
+# interrupt handler draws an expected "marshals a struct by value"
+# warning (see the README).
 check:
 	$(LOUP_BOOTSTRAP) check --no-color
+	for b in $(BOARDS); do (cd $$b && $(LOUP_BOOTSTRAP) check --no-color) || exit 1; done
 
-# Tests import project modules by their path under source/ (`from cli.args
-# import (...)`), the same way the sources do, so source/ goes on LOUPPATH.
-# Narrow the run with TEST_ARGS, e.g. `make test TEST_ARGS="--filter value"`.
-test:
-	LOUPPATH=source$${LOUPPATH:+:$$LOUPPATH} $(LOUP_BOOTSTRAP) test $(TEST_ARGS)
+# All four images (needs Linux x86-64, clang and ld.lld).
+build: $(IMAGES)
 
-# Native executable (needs clang). Windows writes $(BIN).exe.
-build: $(BIN)
-
-$(BIN): $(SOURCES)
+# `loup build` skips a build whose fingerprint (next to the image) matches,
+# and for a manifest under boards/ the fingerprint does not cover the
+# sources in ../../source: it is removed whenever make decides to rebuild.
+$(BUILD_DIR)/%.elf: $(SOURCES)
 	@mkdir -p $(BUILD_DIR)
-	$(LOUP) build --target native -o $@
+	@rm -f $@.loupbuild.fp
+	$(LOUP) build --target freestanding --arch $(call arch_of,$*) -o $@ $(call manifest_dir,$*)
 
-# Everything CI runs, ending with a smoke test of the built binary.
-ci: check test build
-	$(BIN) --version
+# End-to-end: boot every image under QEMU, wait for the demo, type keys,
+# and compare the transcripts and exit statuses with tests/expected/.
+boot: $(IMAGES)
+	bash tests/boot.sh $(BUILD_DIR)
+
+# Boot the scheduler on this terminal, e.g. `make run ARCH=aarch64`. Keys
+# go to the kernel; q quits.
+run: $(BUILD_DIR)/sched-$(ARCH).elf
+	-scripts/qemu.sh $(ARCH) $<
+
+# Everything CI runs.
+ci: check build boot
 
 clean:
-	rm -rf $(BUILD_DIR) .temp
+	rm -rf $(BUILD_DIR) .temp boards/*/.temp

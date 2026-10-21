@@ -1,0 +1,261 @@
+@mode(freestanding)
+
+# The x86_64 board: the Platform the scheduler runs on (an x86-64 CPU in
+# QEMU's pc machine), the panic handler, and the boot code QEMU enters.
+#
+# Runtime: freestanding, x86_64 only. Imported by both x86_64 entry files
+# (main_x86_64.lpfree, selftest_x86_64.lpfree), so `make build` compiles it
+# into build/sched-x86_64.elf and build/selftest-x86_64.elf (`loup build
+# --target freestanding --arch x86_64`, linked at 1 MiB by
+# linker/x86_64.ld). It runs when `make boot` boots those images on QEMU's
+# pc machine; `make check` type-checks it with Stage0.
+#
+# Structure: the Platform, as a template foundation for what the CPU does
+# and an overlay for the devices of the machine around it; the panic
+# handler; then the PVH note and _start, which QEMU enters in 32-bit mode.
+#
+# The foundation and its overlay must be in one module: with the
+# foundation in another, Loup 1.26.0's freestanding build stops with E0107
+# (the foundation's name is not found in the target module's exports).
+# aarch64 has the same pair in arm/board.lpfree.
+
+from appinfo import (STATUS_PANIC);
+from kernel.platform import (Platform);
+from kernel.console import (attach, puts, putDec, newline);
+from kernel.sched import (explainPanic);
+from x86.com1 import (com1Put, com1EnableReceive);
+from x86.chipset import (IRQ_BASE, PIT_DIVISOR, remapPics, startPit);
+from x86.context import (switchContext, newTaskFrame);
+from x86.idt import (loadIdt, gatesInstalled);
+from x86.isr import (installHandlers, explainFault);
+from x86.qemu import (qemuExit);
+
+# ---- The Platform ---------------------------------------------------------------
+
+## What any x86-64 CPU does for the scheduler. The devices around it (the
+## interrupt controller, the timer, the UART, how to power off) are parts
+## the machine's overlay fills in.
+template foundation X86Cpu implements Platform {
+    pub func arch(): string {
+        return "x86_64";
+    }
+
+    pub func machine(): string {
+        return this.machineName();
+    }
+
+    ## The handlers go in first, so that a fault in the rest of bring-up is
+    ## reported rather than ending in a triple fault and a reset.
+    pub func bringUp(): void {
+        installHandlers();
+        loadIdt();
+        puts("cpu: IDT loaded, ");
+        putDec(gatesInstalled() as uint64);
+        puts(" gates");
+        newline();
+        this.startDevices();
+    }
+
+    pub func startTimer(hz: uint64): void {
+        this.startTicking(hz);
+    }
+
+    pub func enableInterrupts(): void {
+        asm { "sti" clobbers: ["memory"] }
+    }
+
+    pub func idle(): void {
+        asm { "hlt" }
+    }
+
+    pub func newTaskFrame(stackTop: uint64, taskId: uint64): uint64 {
+        var sp: uint64 = 0u64;
+        unsafe("raw stack memory: the scheduler hands over the top of a task's own, unused stack") {
+            sp = newTaskFrame(stackTop, taskId);
+        }
+        return sp;
+    }
+
+    pub func switchStacks(saveSpAt: uint64, nextSp: uint64): void {
+        switchContext(saveSpAt, nextSp);
+    }
+
+    pub func halt(status: uint8): void {
+        this.powerOff(status);
+    }
+
+    part func machineName(): string;
+    part func startDevices(): void;
+    part func startTicking(hz: uint64): void;
+    part func powerOff(status: uint8): void;
+}
+
+## QEMU's pc machine: a pair of 8259s, an 8254 timer, COM1, and the
+## isa-debug-exit device scripts/qemu.sh adds.
+template overlay QemuPc onto X86Cpu {
+    part func machineName(): string {
+        return "QEMU pc";
+    }
+
+    part func startDevices(): void {
+        remapPics();
+        puts("pic: IRQs at vectors ");
+        putDec(IRQ_BASE as uint64);
+        puts("-");
+        putDec((IRQ_BASE + 15) as uint64);
+        puts(", timer and COM1 unmasked");
+        newline();
+        com1EnableReceive();
+        puts("com1: receive interrupt on");
+        newline();
+    }
+
+    # PIT_DIVISOR is worked out at compile time for TICK_HZ; `hz` is only
+    # reported.
+    part func startTicking(hz: uint64): void {
+        startPit(PIT_DIVISOR);
+        puts("pit: ");
+        putDec(hz);
+        puts(" Hz (divisor ");
+        putDec(PIT_DIVISOR);
+        puts(")");
+        newline();
+    }
+
+    part func powerOff(status: uint8): void {
+        qemuExit(status);
+    }
+}
+
+## The board, for the entry files' kernelMain.
+pub func pcBoard(): Platform {
+    return X86Cpu();
+}
+
+# ---- Panics ---------------------------------------------------------------------
+
+# With panic = "custom" in the manifest, every panic lands here: an
+# `unreachable` reached (a fault handler, a stack overflow the scheduler
+# found), or a buffer index out of range under bounds = "trap". Interrupts
+# go off and the console is re-attached, so the report is written by
+# polling whatever was running.
+@panic_handler
+func kernelPanic(msg: string, file: string, line: int): noreturn {
+    asm { "cli" }
+    attach(com1Put);
+    puts("PANIC: ");
+    puts(msg);
+    puts(" at ");
+    puts(file);
+    puts(":");
+    putDec(line as uint64);
+    newline();
+    explainFault();
+    explainPanic();
+    qemuExit(STATUS_PANIC);
+    while (true) {
+        asm { "cli" "hlt" }
+    }
+}
+
+# ---- Boot ---------------------------------------------------------------------------
+
+# QEMU's -kernel loads an ELF that carries a PVH note (Xen's
+# XEN_ELFNOTE_PHYS32_ENTRY, type 18) and enters it at the address in the
+# note, in 32-bit protected mode with paging off.
+@section(".note.Xen")
+@naked
+@unsafe("naked: data only, never called; the ELF note QEMU's PVH loader reads")
+func pvhEntryNote(): void {
+    asm {
+        ".align 4"
+        ".long 4"              # name size: "Xen\0"
+        ".long 4"              # descriptor size: one 32-bit address
+        ".long 18"             # XEN_ELFNOTE_PHYS32_ENTRY
+        ".asciz \"Xen\""
+        ".long _start"
+    }
+}
+
+# 32-bit protected mode, paging off, no stack. Long mode needs paging: map
+# the first GiB to itself with 2 MiB pages, using the three tables
+# linker/x86_64.ld reserves, then enable PAE, long mode and paging, load a
+# GDT with a 64-bit code segment and jump into it. Then take the boot stack
+# and call kernelMain, which each entry file defines.
+@entry
+@naked
+@unsafe("naked: entered by QEMU in 32-bit mode with no stack; builds the page tables and enters long mode")
+@section(".text.boot")
+func _start(): void {
+    asm {
+        ".code32"
+        "mov esp, offset __stack_top"
+        # PML4[0] and PDPT[0]: the next table, present (bit 0) and
+        # writable (bit 1).
+        "mov eax, offset __boot_pdpt"
+        "or eax, 3"
+        "mov dword ptr [__boot_pml4], eax"
+        "mov eax, offset __boot_pd"
+        "or eax, 3"
+        "mov dword ptr [__boot_pdpt], eax"
+        # 512 page-directory entries: 2 MiB pages (bit 7), present and
+        # writable, physical address = virtual address.
+        "mov edi, offset __boot_pd"
+        "mov eax, 0x83"
+        "xor ecx, ecx"
+        "2:"
+        "mov dword ptr [edi + ecx*8], eax"
+        "mov dword ptr [edi + ecx*8 + 4], 0"
+        "add eax, 0x200000"
+        "inc ecx"
+        "cmp ecx, 512"
+        "jb 2b"
+        # CR4.PAE (bit 5), the PML4 in CR3, EFER.LME (MSR 0xC0000080,
+        # bit 8); then CR0.PG with CR0.PE turns paging and long mode on.
+        "mov eax, cr4"
+        "or eax, 0x20"
+        "mov cr4, eax"
+        "mov eax, offset __boot_pml4"
+        "mov cr3, eax"
+        "mov ecx, 0xC0000080"
+        "rdmsr"
+        "or eax, 0x100"
+        "wrmsr"
+        "mov eax, cr0"
+        "or eax, 0x80000001"
+        "mov cr0, eax"
+        # Still 32-bit code until CS holds a 64-bit segment: load the GDT
+        # and far-return to selector 0x08 (retf pops the address, then CS).
+        "lgdt [boot_gdt_pointer]"
+        "push 0x08"
+        "push offset 3f"
+        "retf"
+        ".code64"
+        "3:"
+        "mov ax, 0x10"
+        "mov ds, ax"
+        "mov es, ax"
+        "mov ss, ax"
+        "xor ax, ax"
+        "mov fs, ax"
+        "mov gs, ax"
+        "lea rsp, [rip + __stack_top]"
+        "call kernelMain"
+        # kernelMain does not return; if it did, stop here.
+        "4:"
+        "cli"
+        "hlt"
+        "jmp 4b"
+        # The GDT: the null descriptor, 64-bit code (0x08: present, ring 0,
+        # executable, long mode bit), data (0x10: present, writable).
+        ".align 16"
+        "boot_gdt:"
+        ".quad 0"
+        ".quad 0x00209A0000000000"
+        ".quad 0x0000920000000000"
+        "boot_gdt_pointer:"
+        ".short 23"
+        ".long boot_gdt"
+        clobbers: ["memory"]
+    }
+}

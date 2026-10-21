@@ -1,0 +1,27 @@
+@mode(freestanding)
+
+# x86 port I/O: the PC's devices (COM1, the 8259s, the 8254, QEMU's exit
+# device) sit in the I/O port space, reached with in and out.
+#
+# Runtime: freestanding, x86_64 only. The x86 board module imports it, so
+# `make build` compiles it into build/sched-x86_64.elf and
+# build/selftest-x86_64.elf (`loup build --target freestanding --arch
+# x86_64`); the aarch64 images never contain it. It runs when `make boot`
+# boots those images on QEMU's pc machine; `make check` type-checks it with
+# Stage0.
+
+## Writes one byte to an I/O port.
+@interruptSafe
+@unsafe("port I/O: writes a device register in the x86 I/O space")
+pub func outb(port: uint16, value: uint8): void {
+    asm { "out dx, al" in: "dx" = port, "al" = value clobbers: [] }
+}
+
+## Reads one byte from an I/O port.
+@interruptSafe
+@unsafe("port I/O: reads a device register in the x86 I/O space")
+pub func inb(port: uint16): uint8 {
+    var value: uint64 = 0u64;
+    asm { "in al, dx" out: value = "=a" in: "dx" = port clobbers: [] }
+    return (value & 0xFFu64) as uint8;
+}

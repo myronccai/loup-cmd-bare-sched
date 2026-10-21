@@ -1,0 +1,74 @@
+@mode(freestanding)
+
+# The interrupt descriptor table: where the CPU finds the handler for each
+# of its 256 vectors.
+#
+# Runtime: freestanding, x86_64 only. The x86 board module imports it, so
+# `make build` compiles it into build/sched-x86_64.elf and
+# build/selftest-x86_64.elf (`loup build --target freestanding --arch
+# x86_64`); the aarch64 images never contain it. It runs when `make boot`
+# boots those images on QEMU's pc machine; `make check` type-checks it with
+# Stage0.
+
+## What the CPU pushes when it takes an interrupt or exception at ring 0
+## (the error code, when there is one, comes before it and the @interrupt
+## trampoline passes it separately). Handlers borrow it where the CPU put
+## it, so the layout is the CPU's.
+@repr(C)
+pub struct InterruptFrame {
+    pub let rip: uint64;
+    pub let cs: uint64;
+    pub let rflags: uint64;
+    pub let rsp: uint64;
+    pub let ss: uint64;
+}
+
+## `actual` when it equals `expected`. Evaluated by the compiler for the
+## constant below, so a frame that disagrees with the CPU's five words fails
+## the build. (A const func cannot be imported in Loup 1.26.0: each module
+## that checks a layout has its own.)
+const func checkedSize(actual: uint64, expected: uint64): uint64 {
+    if (actual != expected) {
+        unreachable;
+    }
+    return actual;
+}
+
+const FRAME_BYTES = checkedSize(size_of[InterruptFrame](), 40u64);
+
+const CODE_SELECTOR: uint64 = 0x08u64;     # the 64-bit code segment _start loads
+const INTERRUPT_GATE: uint64 = 0x8Eu64;    # present, ring 0, interrupts masked on entry
+
+# 256 gates of two quadwords, on a page of its own (linker/x86_64.ld). The
+# table and the lidt operand are integers, not structs: a buffer of structs
+# holds references in a 1.26.0 freestanding build, never the bytes the CPU
+# reads.
+@section(".idt")
+var table: buffer[uint64, 512];
+var pointer: buffer[uint64, 2];
+var installed: int = 0;
+
+## Points `vector` at `handler`. A gate's first quadword holds the
+## handler's bits 0-15, the selector, the type and bits 16-31; the second
+## holds bits 32-63.
+pub func setGate(vector: int, handler: uint64): void {
+    let low = (handler & 0xFFFFu64) | (CODE_SELECTOR << 16u64) | (INTERRUPT_GATE << 40u64)
+        | (((handler >> 16u64) & 0xFFFFu64) << 48u64);
+    table[vector * 2] = low;
+    table[vector * 2 + 1] = handler >> 32u64;
+    installed += 1;
+}
+
+pub func gatesInstalled(): int {
+    return installed;
+}
+
+## Loads the table: lidt reads a 2-byte limit (4095, the table's size - 1)
+## followed by the 8-byte base, so the base straddles the two quadwords.
+pub func loadIdt(): void {
+    let base = addressOf(table);
+    pointer[0] = 4095u64 | (base << 16u64);
+    pointer[1] = base >> 48u64;
+    let operand = addressOf(pointer);
+    asm { "lidt [rax]" in: "rax" = operand clobbers: ["memory"] }
+}

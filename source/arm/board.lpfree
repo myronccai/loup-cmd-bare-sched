@@ -1,0 +1,181 @@
+@mode(freestanding)
+
+# The aarch64 board: the Platform the scheduler runs on (a Cortex-A53 in
+# QEMU's virt machine), the panic handler, and the entry QEMU jumps to.
+#
+# Runtime: freestanding, aarch64 only. Imported by both aarch64 entry
+# files (main_aarch64.lpfree, selftest_aarch64.lpfree), so `make build`
+# compiles it into build/sched-aarch64.elf and build/selftest-aarch64.elf
+# (`loup build --target freestanding --arch aarch64 boards/...`, linked at
+# 0x40080000 by linker/aarch64.ld). It runs when `make boot` boots those
+# images on QEMU's virt machine; `make check` type-checks it with Stage0
+# from boards/aarch64.
+#
+# Structure: the Platform, as a template foundation for what the CPU does
+# and an overlay for the devices of the machine around it; the panic
+# handler; then _start.
+#
+# The foundation and its overlay must be in one module: with the
+# foundation in another, Loup 1.26.0's freestanding build stops with E0107
+# (the foundation's name is not found in the target module's exports).
+# x86_64 has the same pair in x86/board.lpfree.
+
+from appinfo import (STATUS_PANIC);
+from kernel.platform import (Platform);
+from kernel.console import (attach, puts, putDec, putHex, newline);
+from kernel.sched import (explainPanic);
+from arm.pl011 import (pl011Put, pl011EnableReceive);
+from arm.gic import (INTID_TIMER, INTID_UART, gicStart);
+from arm.timer import (timerFrequency, timerStart);
+from arm.context import (switchContext, newTaskFrame);
+from arm.vectors import (installVectors, explainFault);
+from arm.qemu import (qemuExit);
+
+# ---- The Platform ---------------------------------------------------------------
+
+## What any AArch64 CPU at EL1 does for the scheduler. The devices around it
+## (the interrupt controller, the timer, the UART, how to power off) are
+## parts the machine's overlay fills in.
+template foundation Arm64Cpu implements Platform {
+    pub func arch(): string {
+        return "aarch64";
+    }
+
+    pub func machine(): string {
+        return this.machineName();
+    }
+
+    ## The vectors go in first, so that a fault in the rest of bring-up is
+    ## reported rather than looping in an empty vector.
+    pub func bringUp(): void {
+        let base = installVectors();
+        puts("cpu: vectors at ");
+        putHex(base);
+        puts(" (VBAR_EL1)");
+        newline();
+        this.startDevices();
+    }
+
+    pub func startTimer(hz: uint64): void {
+        this.startTicking(hz);
+    }
+
+    pub func enableInterrupts(): void {
+        asm { "msr daifclr, #2" clobbers: ["memory"] }
+    }
+
+    pub func idle(): void {
+        asm { "wfi" }
+    }
+
+    pub func newTaskFrame(stackTop: uint64, taskId: uint64): uint64 {
+        var sp: uint64 = 0u64;
+        unsafe("raw stack memory: the scheduler hands over the top of a task's own, unused stack") {
+            sp = newTaskFrame(stackTop, taskId);
+        }
+        return sp;
+    }
+
+    pub func switchStacks(saveSpAt: uint64, nextSp: uint64): void {
+        switchContext(saveSpAt, nextSp);
+    }
+
+    pub func halt(status: uint8): void {
+        this.powerOff(status);
+    }
+
+    part func machineName(): string;
+    part func startDevices(): void;
+    part func startTicking(hz: uint64): void;
+    part func powerOff(status: uint8): void;
+}
+
+## QEMU's virt machine: a GICv2, the generic timer's virtual timer, a
+## PL011, and semihosting for leaving QEMU.
+template overlay QemuVirt onto Arm64Cpu {
+    part func machineName(): string {
+        return "QEMU virt";
+    }
+
+    part func startDevices(): void {
+        gicStart();
+        puts("gic: GICv2 on, INTID ");
+        putDec(INTID_TIMER);
+        puts(" (virtual timer) and ");
+        putDec(INTID_UART);
+        puts(" (PL011) enabled");
+        newline();
+        pl011EnableReceive();
+        puts("pl011: receive interrupt on");
+        newline();
+    }
+
+    part func startTicking(hz: uint64): void {
+        let period = timerStart(hz);
+        puts("timer: ");
+        putDec(hz);
+        puts(" Hz (");
+        putDec(period);
+        puts(" counts of ");
+        putDec(timerFrequency());
+        puts(" Hz)");
+        newline();
+    }
+
+    part func powerOff(status: uint8): void {
+        qemuExit(status);
+    }
+}
+
+## The board, for the entry files' kernelMain.
+pub func virtBoard(): Platform {
+    return Arm64Cpu();
+}
+
+# ---- Panics ---------------------------------------------------------------------
+
+# With panic = "custom" in the manifest, every panic lands here: an
+# `unreachable` reached (a fault handler, a stack overflow the scheduler
+# found), or a buffer index out of range under bounds = "trap". Interrupts
+# (all four DAIF bits) go off and the console is re-attached, so the report
+# is written by polling whatever was running.
+@panic_handler
+func kernelPanic(msg: string, file: string, line: int): noreturn {
+    asm { "msr daifset, #0xf" clobbers: ["memory"] }
+    attach(pl011Put);
+    puts("PANIC: ");
+    puts(msg);
+    puts(" at ");
+    puts(file);
+    puts(":");
+    putDec(line as uint64);
+    newline();
+    explainFault();
+    explainPanic();
+    qemuExit(STATUS_PANIC);
+    while (true) {
+        asm { "wfi" }
+    }
+}
+
+# ---- Entry ----------------------------------------------------------------------------
+
+# QEMU starts the CPU here at EL1, MMU and caches off, with no stack: take
+# the boot stack linker/aarch64.ld reserves and call kernelMain, which each
+# entry file defines.
+@entry
+@naked
+@unsafe("naked: runs before there is a stack; sets sp, then calls kernelMain")
+@section(".text.boot")
+func _start(): void {
+    asm {
+        "adrp x0, __stack_top"
+        "add x0, x0, :lo12:__stack_top"
+        "mov sp, x0"
+        "bl kernelMain"
+        # kernelMain does not return; if it did, wait here.
+        "1:"
+        "wfe"
+        "b 1b"
+    }
+}

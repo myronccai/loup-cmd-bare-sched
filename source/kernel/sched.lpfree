@@ -1,0 +1,462 @@
+@mode(freestanding)
+
+# The scheduler: ready queues, the clock, and the operations that move
+# tasks between states: spawnTask, yield, sleep, block, wake, exit, and the
+# preemption the timer interrupt performs.
+#
+# Runtime: freestanding, shared by both scheduler images,
+# build/sched-x86_64.elf and build/sched-aarch64.elf (`loup build --target
+# freestanding`): no operating system, runtime library, heap or
+# exceptions. It runs when `make boot` boots each image under QEMU, waits
+# for the demo and types keys; `make check` type-checks it with Stage0.
+# The self-test images use the clock and the ready queues without
+# switching.
+#
+# Structure: the state; RunQueue; the core, dispatch(), which picks the
+# next task and switches to it with interrupts masked; the interrupt-side
+# entry points (clockTick, keyArrived, preemptIfNeeded); the task-side
+# operations; the schedule trace; start-up and the stack-overflow report.
+#
+# Every switch happens inside dispatch() with interrupts masked, and every
+# path that resumes a task restores that task's own interrupt state: the
+# irqRestore after its reschedule(), the iretq/eret of the interrupt it
+# was preempted in, or the board's task entry, which unmasks interrupts
+# before a new task's first instruction.
+
+from kernel.platform import (Platform);
+from kernel.queue import (Queue);
+from kernel.console import (puts, putDec, newline);
+from kernel.tasks import (TaskState, Wait, MAX_TASKS, IDLE_TASK, PRIO_IDLE, PRIO_BACKGROUND,
+    PRIO_NORMAL, CODE_READY, CODE_RUNNING, CODE_SLEEPING, CODE_INPUT, addRow, taskCount,
+    nameOf, priorityOf, entryOf, entryArgOf, countRun, codeOf, codeArgOf, setCode, setState,
+    longestWaiter, armGuard, guardIntact, stackTopOf, stackBytes);
+from debug.recording import (RecordStream, rs_init, rs_record, rs_replay, rs_stopped,
+    overflow_halt, nondet_timer, nondet_sched);
+
+pub const TICK_HZ: uint64 = 100u64;
+
+const SEQ_CST: int = 5;
+
+# The schedule trace (below) is a debugging aid: with this false, `if const`
+# leaves the recording out of the image and the trace stays empty.
+const TRACE_SCHEDULE: bool = true;
+
+var gBoard: Platform;
+var current: int = 0;
+var ticks: uint64 = 0u64;
+var switches: uint64 = 0u64;
+var preemptions: uint64 = 0u64;
+
+# Each task's stack pointer while it is not running.
+var savedSp: buffer[uint64, 8];
+
+# Keys from the UART's interrupt, until the task waiting for input takes
+# them. Pushed by keyArrived, popped by waitKey with interrupts masked.
+var keys: Queue[uint8];
+
+# The task that overran its stack (+ 1; 0 = none), for the panic report.
+var overflowed: uint64 = 0u64;
+
+# ---- The run queue -------------------------------------------------------------
+
+# One FIFO per priority above idle. Only RunQueue's modifier methods touch
+# them. (A class cannot hold another class instance in a Loup 1.26.0
+# freestanding build, so the queues live beside the class that guards them.)
+var readyNormal: Queue[uint8];
+var readyBackground: Queue[uint8];
+
+# The run queue's lock is the innermost in the kernel: the scheduler takes
+# it while a task may hold the items lock (rank 20) or the console lock
+# (rank 30), and takes nothing while holding it. On this single-CPU kernel
+# it is never contended, because every caller masks interrupts first; its
+# rank makes the compiler reject any code that would take a lower-ranked
+# lock inside it.
+@lockOrder(40)
+pub synchronized class RunQueue {
+    ## Appends `id` to the queue of its priority (idle is never queued).
+    pub modifier func enqueue(id: int): void {
+        let prio = priorityOf(id);
+        var kept = true;
+        safe {
+            if (prio == PRIO_NORMAL) {
+                kept = readyNormal.push(id as uint8);
+            } else if (prio == PRIO_BACKGROUND) {
+                kept = readyBackground.push(id as uint8);
+            }
+        }
+        # Each task is queued at most once and the queues hold MAX_TASKS.
+        if (!kept) {
+            unreachable;
+        }
+    }
+
+    ## Takes the next task to run: the oldest of the highest priority, or
+    ## -1 when only idle is left.
+    pub modifier func next(): int {
+        var id = -1;
+        safe {
+            if (!readyNormal.isEmpty()) {
+                match readyNormal.pop() {
+                    Some(t) => { id = t as int; },
+                    None => { },
+                }
+            } else if (!readyBackground.isEmpty()) {
+                match readyBackground.pop() {
+                    Some(t) => { id = t as int; },
+                    None => { },
+                }
+            }
+        }
+        return id;
+    }
+
+    ## True when a task of a priority higher than `prio` is waiting.
+    pub modifier func readyAbove(prio: uint64): bool {
+        if (!readyNormal.isEmpty() and prio < PRIO_NORMAL) {
+            return true;
+        }
+        return !readyBackground.isEmpty() and prio < PRIO_BACKGROUND;
+    }
+
+    pub modifier func waiting(): int {
+        return readyNormal.length() + readyBackground.length();
+    }
+}
+
+pub var runQueue: RunQueue;
+
+# ---- The core ----------------------------------------------------------------
+
+## Marks `id` ready and queues it. Interrupts masked.
+@interruptSafe
+func makeReady(id: int): void {
+    setCode(id, CODE_READY, 0u64);
+    if (id != IDLE_TASK) {
+        runQueue.enqueue(id);
+    }
+}
+
+## The task that just ran past its stack: record it and panic. The board's
+## panic handler prints the record (explainPanic).
+@interruptSafe
+func stackOverflow(id: int): void {
+    atomicStoreU64(addressOf(overflowed), (id as uint64) + 1u64, SEQ_CST);
+    unreachable;
+}
+
+## Switches to the next ready task, or to idle when there is none. The
+## current task's new state has been recorded (and the task queued again if
+## it is still ready). Interrupts are masked: this runs in an interrupt
+## handler, or between irqSaveDisable and irqRestore. Returns true when it
+## switched, once the current task has been resumed.
+@interruptSafe
+func dispatch(): bool {
+    let prev = current;
+    if (!guardIntact(prev)) {
+        stackOverflow(prev);
+    }
+    var next = runQueue.next();
+    if (next < 0) {
+        next = IDLE_TASK;
+    }
+    setCode(next, CODE_RUNNING, 0u64);
+    if (next == prev) {
+        return false;
+    }
+    current = next;
+    countRun(next);
+    switches += 1u64;
+    gBoard.switchStacks(addressOf(savedSp) + (prev as uint64) * 8u64, savedSp[next]);
+    return true;
+}
+
+# ---- Interrupt side ------------------------------------------------------------
+
+## The sleeping task due by `now` with the earliest wake-up tick (the lowest
+## id among equals), or -1.
+@interruptSafe
+@no_zero_locals
+func earliestDue(now: uint64): int {
+    var best = -1;
+    var bestAt: uint64 = 0u64;
+    var id = 0;
+    let count = taskCount();
+    while (id < count) {
+        if (codeOf(id) == CODE_SLEEPING) {
+            let at = codeArgOf(id);
+            if (at <= now and (best < 0 or at < bestAt)) {
+                best = id;
+                bestAt = at;
+            }
+        }
+        id += 1;
+    }
+    return best;
+}
+
+## Called by the timer interrupt: one more tick, and every sleeper whose
+## tick has come is made ready, earliest first. Runs 100 times a second.
+@interruptSafe
+@no_zero_locals
+pub func clockTick(): void {
+    let now = atomicFetchAddU64(addressOf(ticks), 1u64, SEQ_CST) + 1u64;
+    var due = earliestDue(now);
+    while (due >= 0) {
+        makeReady(due);
+        due = earliestDue(now);
+    }
+}
+
+## Called by the UART's interrupt for each byte received: queue it (a full
+## queue drops it) and wake the task waiting for input.
+@interruptSafe
+pub func keyArrived(key: uint8): void {
+    safe {
+        let _ = keys.push(key);
+    }
+    let waiter = longestWaiter(CODE_INPUT, 0u64);
+    if (waiter >= 0) {
+        makeReady(waiter);
+    }
+}
+
+## Called last by every interrupt handler, after the interrupt has been
+## acknowledged: when a task of a higher priority than the interrupted one
+## is now ready, switch to it. The interrupted task goes back to its queue
+## and resumes later inside this call, then returns from its interrupt.
+@interruptSafe
+pub func preemptIfNeeded(): void {
+    if (runQueue.readyAbove(priorityOf(current))) {
+        preemptions += 1u64;
+        makeReady(current);
+        let _switched = dispatch();
+    }
+}
+
+# ---- Task side -------------------------------------------------------------------
+
+pub func currentTask(): int {
+    return current;
+}
+
+pub func now(): uint64 {
+    return atomicLoadU64(addressOf(ticks), SEQ_CST);
+}
+
+pub func switchCount(): uint64 {
+    return switches;
+}
+
+pub func preemptionCount(): uint64 {
+    return preemptions;
+}
+
+## Gives up the CPU once the current task's new state is recorded, and
+## returns when the task is picked again. The caller has masked interrupts.
+func reschedule(): void {
+    if (dispatch()) {
+        traceResume();
+    }
+}
+
+## Lets every other ready task of the same priority run first.
+pub func yieldNow(): void {
+    let saved = irqSaveDisable();
+    makeReady(current);
+    reschedule();
+    irqRestore(saved);
+}
+
+## Sleeps until the clock reaches `tick` (returns at once if it has).
+## Deadlines are absolute, so a periodic task does not drift: each period
+## starts where the last one was due, not where the task got the CPU.
+pub func sleepUntil(tick: uint64): void {
+    let saved = irqSaveDisable();
+    if (tick > now()) {
+        setState(current, TaskState.Sleeping(tick));
+        reschedule();
+    }
+    irqRestore(saved);
+}
+
+## Blocks the current task on `w` until wake() or wakeLongestWaiter makes it
+## ready. For the synchronization layer, which holds interrupts masked
+## from its check of the condition to this call.
+pub func block(w: Wait): void {
+    setState(current, TaskState.Blocked(w));
+    reschedule();
+}
+
+## Makes the longest waiter on `code`/`arg` ready; returns its id, or -1
+## when no task waits. Interrupts masked by the caller.
+pub func wakeLongestWaiter(code: uint64, arg: uint64): int {
+    let id = longestWaiter(code, arg);
+    if (id >= 0) {
+        makeReady(id);
+    }
+    return id;
+}
+
+## The next key typed on the serial port, waiting for one if none is queued.
+pub func waitKey(): uint8 {
+    var key: uint8 = 0u8;
+    with (g = InterruptGuard.disable()) {
+        if (keys.isEmpty()) {
+            block(Wait.Input);
+        }
+        safe {
+            match keys.pop() {
+                Some(k) => { key = k; },
+                None => { unreachable; },
+            }
+        }
+    }
+    return key;
+}
+
+## Ends the current task. Its stack is never used again.
+func exitCurrent(): void {
+    let _saved = irqSaveDisable();
+    setState(current, TaskState.Done);
+    let _switched = dispatch();
+    unreachable;
+}
+
+pub enum SpawnError {
+    TableFull,
+    IdlePriority,
+}
+
+pub func spawnErrorText(e: SpawnError): string {
+    match e {
+        SpawnError.TableFull => { return "the task table is full"; },
+        SpawnError.IdlePriority => { return "only the boot context runs at idle priority"; },
+    }
+}
+
+## Creates a task that will run `entry(arg)` at `priority`, and queues it.
+## It first runs when the scheduler picks it, through the board's frame.
+pub func spawnTask(name: string, priority: uint64, entry: fn(uint64): void, arg: uint64): Result[int, SpawnError] {
+    if (priority == PRIO_IDLE) {
+        return Err(SpawnError.IdlePriority);
+    }
+    if (taskCount() >= MAX_TASKS) {
+        return Err(SpawnError.TableFull);
+    }
+    var id = 0;
+    with (g = InterruptGuard.disable()) {
+        id = addRow(name, priority, entry, arg);
+        unsafe("raw stack memory: the new task's guard, in the slot the table reserved") {
+            armGuard(id);
+        }
+        savedSp[id] = gBoard.newTaskFrame(stackTopOf(id), id as uint64);
+        runQueue.enqueue(id);
+    }
+    return Ok(id);
+}
+
+## Where every task begins. The board's task entry calls it by name, with
+## the platform's C calling convention, on the task's own stack and with
+## interrupts unmasked. A task that returns from its entry function ends.
+pub func taskStart(id: uint64): void {
+    traceResume();
+    let entry = entryOf(id as int);
+    entry(entryArgOf(id as int));
+    exitCurrent();
+}
+
+pub func haltMachine(status: uint8): void {
+    gBoard.halt(status);
+}
+
+# ---- The schedule trace ------------------------------------------------------------
+
+# Every time a normal-priority task gets the CPU from another task, two
+# records: the tick (nondet_timer) and the task (nondet_sched). That is the
+# schedule a replay of this run would have to reproduce. Preemptions of the
+# background task are left out: they fall wherever the timer interrupt
+# lands. The stream is ~17 KiB, so it is a module global; halt-on-full
+# keeps the first 512 decisions.
+var gTrace: RecordStream;
+
+func traceResume(): void {
+    if const (TRACE_SCHEDULE) {
+        if (priorityOf(current) == PRIO_NORMAL) {
+            let _at = rs_record(edits: gTrace, nondet_timer(), now());
+            let _who = rs_record(edits: gTrace, nondet_sched(), current as uint64);
+        }
+    }
+}
+
+## A value with the tick it belongs to.
+pub struct Stamped[T] {
+    pub let tick: uint64;
+    pub let value: T;
+}
+
+## How many scheduling decisions the trace holds.
+pub func traceLength(): uint64 {
+    return gTrace.count / 2u64;
+}
+
+pub func traceFull(): bool {
+    return rs_stopped(gTrace);
+}
+
+## Decision `i`, replayed from its two records: the task that got the CPU,
+## stamped with the tick.
+pub func traceEntry(i: uint64): Stamped[int] {
+    let at = rs_replay(gTrace, i * 2u64).payload;
+    let task = rs_replay(gTrace, i * 2u64 + 1u64).payload as int;
+    return Stamped[int](tick = at, value = task);
+}
+
+# ---- Start-up --------------------------------------------------------------------
+
+# Idle's row needs an entry function; idle never starts through taskStart
+# (it is the boot context already running).
+func idleEntry(arg: uint64): void {
+    unreachable;
+}
+
+## Makes the boot context task 0, "idle", and keeps the board for the
+## switches. Tasks can be spawned from here on.
+pub func schedInit(board: Platform): void {
+    gBoard = board;
+    rs_init(edits: gTrace, 0u32, overflow_halt());
+    current = addRow("idle", PRIO_IDLE, idleEntry, 0u64);
+    setCode(current, CODE_RUNNING, 0u64);
+}
+
+## Starts the clock at `hz`, unmasks interrupts and gives the CPU to the
+## spawned tasks. The boot context carries on as the idle task: it only gets
+## the CPU back when no other task is ready, and then sleeps until an
+## interrupt makes one ready (the interrupt handler then switches to it
+## directly).
+pub func runScheduler(hz: uint64): void {
+    gBoard.startTimer(hz);
+    gBoard.enableInterrupts();
+    let saved = irqSaveDisable();
+    makeReady(IDLE_TASK);
+    reschedule();
+    irqRestore(saved);
+    while (true) {
+        gBoard.idle();
+    }
+}
+
+## For the panic handler: what the kernel knew when it panicked.
+pub func explainPanic(): void {
+    let task = atomicLoadU64(addressOf(overflowed), SEQ_CST);
+    if (task != 0u64) {
+        let id = (task - 1u64) as int;
+        puts("  stack overflow: task ");
+        putDec(id as uint64);
+        puts(" (");
+        puts(nameOf(id));
+        puts(") wrote past the end of its ");
+        putDec(stackBytes() / 1024u64);
+        puts(" KiB stack, into its guard");
+        newline();
+    }
+}

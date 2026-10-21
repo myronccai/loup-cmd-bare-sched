@@ -1,0 +1,20 @@
+@mode(freestanding)
+
+# Name, version and exit statuses of the loup-cmd-bare-sched images.
+#
+# Runtime: freestanding, shared by all four images (the scheduler and the
+# self-test, each for x86_64 and aarch64). `make build` compiles it into
+# each with `loup build --target freestanding`: no operating system,
+# runtime library, heap or exceptions. `make boot` boots every image under
+# QEMU and compares the transcripts; `make check` type-checks it with
+# Stage0 through each image's entry file.
+
+pub const APP_NAME: string = "loup-cmd-bare-sched";
+pub const APP_VERSION: string = "0.1.0";
+
+# The status an image stops with. The board turns it into QEMU's exit
+# status: x86_64 writes `0x10 | status` to isa-debug-exit (QEMU exits with
+# 33, 35 or 37), aarch64 passes it to semihosting SYS_EXIT (0, 1 or 2).
+pub const STATUS_OK: uint8 = 0u8;
+pub const STATUS_TEST_FAILED: uint8 = 1u8;
+pub const STATUS_PANIC: uint8 = 2u8;

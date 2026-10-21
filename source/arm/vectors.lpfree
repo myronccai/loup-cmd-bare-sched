@@ -1,0 +1,198 @@
+@mode(freestanding)
+
+# The aarch64 exception vector table and its handlers.
+#
+# Runtime: freestanding, aarch64 only. The arm board module imports it, so
+# `make build` compiles it into build/sched-aarch64.elf and
+# build/selftest-aarch64.elf (`loup build --target freestanding --arch
+# aarch64 boards/...`); the x86_64 images never contain it. It runs when
+# `make boot` boots those images on QEMU's virt machine (Cortex-A53);
+# `make check` type-checks it with Stage0 from boards/aarch64.
+#
+# Structure: the frame, the IRQ handler, the synchronous handler (every
+# synchronous exception here is a fault), the catch-all, the table, and
+# installVectors. AArch64 has one entry per kind of exception (synchronous,
+# IRQ, FIQ, SError) and per origin; the kernel runs at EL1 on SP_EL1, so
+# the "current EL, SPx" entries are the ones that matter. Each branches to
+# an @interrupt function, whose trampoline saves the registers a call may
+# clobber and the exception registers, and returns with eret.
+
+from arm.gic import (INTID_TIMER, INTID_UART, INTID_SPURIOUS, gicAcknowledge, gicEnd);
+from arm.timer import (timerRearm);
+from arm.pl011 import (pl011HasByte, pl011Take);
+from kernel.sched import (clockTick, keyArrived, preemptIfNeeded);
+from kernel.console import (puts, putHex, newline);
+
+## What the trampoline stores above the registers it saves. (Not called
+## InterruptFrame: Loup 1.26.0 has a built-in of that name with the x86_64
+## fields.)
+@repr(C)
+pub struct ExceptionFrame {
+    pub let elr_el1: uint64;     # where the exception returns to
+    pub let spsr_el1: uint64;    # the saved processor state
+    pub let sp_el0: uint64;
+    pub let esr_el1: uint64;     # the syndrome: the exception class in bits 26-31
+}
+
+## `actual` when it equals `expected`, evaluated by the compiler: a frame
+## that disagrees with the trampoline's four words fails the build.
+const func checkedSize(actual: uint64, expected: uint64): uint64 {
+    if (actual != expected) {
+        unreachable;
+    }
+    return actual;
+}
+
+const FRAME_BYTES = checkedSize(size_of[ExceptionFrame](), 32u64);
+
+# ---- IRQs ---------------------------------------------------------------------
+
+## The IRQ entry: ask the GIC which interrupt it is, handle it, end it, and
+## let the scheduler switch tasks last (this handler then finishes when the
+## interrupted task is resumed).
+@interrupt(arch: "aarch64")
+func isrIrq(frame: borrow ExceptionFrame): void {
+    let acknowledged = gicAcknowledge();
+    let intid = acknowledged & 0x3FFu64;
+    if (intid == INTID_SPURIOUS) {
+        return;
+    }
+    if (intid == INTID_TIMER) {
+        timerRearm();
+        clockTick();
+    } else if (intid == INTID_UART) {
+        while (pl011HasByte()) {
+            keyArrived(pl011Take());
+        }
+    }
+    gicEnd(acknowledged);
+    preemptIfNeeded();
+}
+
+# ---- Faults -------------------------------------------------------------------
+
+# The fault that stopped the kernel: the syndrome + 1 (0: none), the
+# instruction and the fault address register.
+var faultSyndrome: uint64 = 0u64;
+var faultPc: uint64 = 0u64;
+var faultAddress: uint64 = 0u64;
+
+@interruptSafe
+func readFar(): uint64 {
+    var a: uint64 = 0u64;
+    asm { "mrs x0, far_el1" out: a = "=x0" clobbers: [] }
+    return a;
+}
+
+@interruptSafe
+func recordFault(syndrome: uint64, pc: uint64): void {
+    faultPc = pc;
+    faultAddress = readFar();
+    faultSyndrome = syndrome + 1u64;
+}
+
+## The synchronous entry. This kernel makes no system calls, so every
+## synchronous exception is a fault: record it and panic (`unreachable`;
+## panic = "custom" calls the board's @panic_handler).
+@interrupt(arch: "aarch64")
+func isrSync(frame: borrow ExceptionFrame): void {
+    recordFault(frame.esr_el1, frame.elr_el1);
+    unreachable;
+}
+
+@interruptSafe
+func readEsr(): uint64 {
+    var v: uint64 = 0u64;
+    asm { "mrs x0, esr_el1" out: v = "=x0" clobbers: [] }
+    return v;
+}
+
+@interruptSafe
+func readElr(): uint64 {
+    var v: uint64 = 0u64;
+    asm { "mrs x0, elr_el1" out: v = "=x0" clobbers: [] }
+    return v;
+}
+
+# Every other entry (FIQ, SError, the SP_EL0 and lower-EL origins) is not
+# expected. It is reached by a plain branch from the table, so it is not an
+# @interrupt function; @section keeps it in the image, since only the
+# table's assembly refers to it.
+@section(".text.unexpected")
+func vectorUnexpected(): void {
+    recordFault(readEsr(), readElr());
+    unreachable;
+}
+
+## For the panic handler: the fault, if one caused the panic.
+pub func explainFault(): void {
+    if (faultSyndrome == 0u64) {
+        return;
+    }
+    puts("  cpu fault: esr ");
+    putHex(faultSyndrome - 1u64);
+    puts(", pc ");
+    putHex(faultPc);
+    puts(", far ");
+    putHex(faultAddress);
+    newline();
+}
+
+# ---- The table ------------------------------------------------------------------
+
+# VBAR_EL1's table: 16 entries of 128 bytes, 2 KiB aligned (linker/aarch64.ld
+# gives .text.vectors its own aligned section). Four groups of four: current
+# EL with SP_EL0, current EL with SPx (this kernel), lower EL in AArch64,
+# lower EL in AArch32; in each, synchronous, IRQ, FIQ, SError.
+@section(".text.vectors")
+@naked
+@unsafe("naked: the exception vector table; each 128-byte entry is one branch")
+func vectorTable(): void {
+    asm {
+        "b vectorUnexpected"
+        ".balign 128"
+        "b vectorUnexpected"
+        ".balign 128"
+        "b vectorUnexpected"
+        ".balign 128"
+        "b vectorUnexpected"
+        ".balign 128"
+        "b isrSync"
+        ".balign 128"
+        "b isrIrq"
+        ".balign 128"
+        "b vectorUnexpected"
+        ".balign 128"
+        "b vectorUnexpected"
+        ".balign 128"
+        "b vectorUnexpected"
+        ".balign 128"
+        "b vectorUnexpected"
+        ".balign 128"
+        "b vectorUnexpected"
+        ".balign 128"
+        "b vectorUnexpected"
+        ".balign 128"
+        "b vectorUnexpected"
+        ".balign 128"
+        "b vectorUnexpected"
+        ".balign 128"
+        "b vectorUnexpected"
+        ".balign 128"
+        "b vectorUnexpected"
+    }
+}
+
+## Points VBAR_EL1 at the table; returns its address.
+pub func installVectors(): uint64 {
+    var base: uint64 = 0u64;
+    asm {
+        "adrp x0, vectorTable"
+        "add x0, x0, :lo12:vectorTable"
+        "msr vbar_el1, x0"
+        "isb"
+        out: base = "=x0"
+        clobbers: ["memory"]
+    }
+    return base;
+}

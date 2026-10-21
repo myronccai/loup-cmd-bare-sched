@@ -1,0 +1,87 @@
+@mode(freestanding)
+
+# A first-in, first-out queue over a fixed buffer, generic in what it holds:
+# the scheduler's ready queues and the key queue hold task ids and key codes
+# (Queue[uint8]), the producers and the consumer share a Queue[uint64].
+#
+# Runtime: freestanding, shared by all four images. `make build` compiles
+# it into each with `loup build --target freestanding`: no operating
+# system, runtime library, heap or exceptions. It runs when `make boot`
+# boots the images under QEMU; the self-test images exercise it directly.
+# `make check` type-checks it with Stage0.
+#
+# A Queue is a class, not a struct: Loup 1.26.0's Stage0 checker rejects a
+# `buffer[T, N]` field in a generic struct (E_STRUCT_CLASS_FIELD). Instances
+# are module variables (`var items: Queue[uint64];`), zeroed at boot. Keep
+# T a scalar: in a freestanding build a buffer of structs holds references,
+# so struct values pushed from the same place in the code would all be the
+# same value.
+
+## Every queue has room for this many values; setLimit lowers it.
+pub const QUEUE_SLOTS: int = 8;
+
+pub class Queue[T] {
+    var slots: buffer[T, 8];
+    var head: int = 0;
+    var count: int = 0;
+    var limit: int = 8;
+
+    ## Caps the queue at `n` values (1 to QUEUE_SLOTS) and empties it.
+    pub modifier func setLimit(n: int): void {
+        if (n < 1 or n > QUEUE_SLOTS) {
+            unreachable;
+        }
+        this.limit = n;
+        this.head = 0;
+        this.count = 0;
+    }
+
+    pub func length(): int {
+        return this.count;
+    }
+
+    pub func capacity(): int {
+        return this.limit;
+    }
+
+    pub func isEmpty(): bool {
+        return this.count == 0;
+    }
+
+    pub func isFull(): bool {
+        return this.count == this.limit;
+    }
+
+    ## Appends `v`; false (and the queue unchanged) when it is full.
+    pub modifier func push(v: T): bool {
+        if (this.count == this.limit) {
+            return false;
+        }
+        this.slots[(this.head + this.count) % QUEUE_SLOTS] = v;
+        this.count += 1;
+        return true;
+    }
+
+    ## Takes the oldest value, or None when the queue is empty. The Option
+    ## lives in one static block per instantiation (Loup 1.26.0), so a
+    ## caller reads it before anything else can call pop on a queue of the
+    ## same type: the kernel's callers hold interrupts masked.
+    pub modifier func pop(): Option[T] {
+        if (this.count == 0) {
+            return None;
+        }
+        let v = this.slots[this.head];
+        this.head = (this.head + 1) % QUEUE_SLOTS;
+        this.count -= 1;
+        return Some(v);
+    }
+
+    ## The value `i` places behind the head (0 is the oldest); `i` must be
+    ## below length().
+    pub func at(i: int): T {
+        if (i < 0 or i >= this.count) {
+            unreachable;
+        }
+        return this.slots[(this.head + i) % QUEUE_SLOTS];
+    }
+}

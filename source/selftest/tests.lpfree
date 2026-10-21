@@ -1,0 +1,377 @@
+@mode(freestanding)
+
+# Unit tests for the kernel's pieces that can be checked without switching
+# tasks: the generic queue, the console's number formatting, the task
+# states, the scheduler's wake-up order and priorities, semaphore counting,
+# and the stack guards.
+#
+# Runtime: freestanding, shared by the two self-test images,
+# build/selftest-x86_64.elf and build/selftest-aarch64.elf (`loup build
+# --target freestanding`, from boards/selftest-*/package.lppkg); never part
+# of the scheduler images. `make boot` boots each self-test image under
+# QEMU and compares its report with tests/expected/selftest-*.txt; QEMU's
+# exit status says whether every test passed. `loup-bootstrap test
+# --freestanding` cannot run these in Loup 1.26.0 (it does not find a
+# project's modules), so the image carries its own runner.
+#
+# Structure: the runner (debug.assert_fs sets a flag when an expectation
+# fails; runTest clears it, runs one test and reads it back); a console
+# capture for the formatting tests; the tests, in the order of the modules
+# they cover; runAll.
+
+from appinfo import (APP_NAME, APP_VERSION, STATUS_OK, STATUS_TEST_FAILED);
+from kernel.platform import (Platform);
+from kernel.console import (attach, puts, putDec, putDecWidth, putHex, putCell, newline,
+    decimalWidth);
+from kernel.queue import (Queue);
+from kernel.tasks import (TaskState, Wait, PRIO_NORMAL, PRIO_BACKGROUND, PRIO_IDLE,
+    CODE_SEMAPHORE, CODE_READY, taskCount, stateOf, setState, codeOf, longestWaiter,
+    guardIntact, stackTopOf, stackBytes);
+from kernel.sched import (SpawnError, runQueue, schedInit, spawnTask, clockTick, now);
+from kernel.sync import (Semaphore);
+from debug.assert_fs import (expectFs, expectEqFs, loupTestResetFail, loupTestDidFail);
+
+var passed: int = 0;
+var failed: int = 0;
+
+# Freestanding Loup has no exceptions, so a failed expectation cannot stop
+# a test: it only sets the flag, and the test runs to its end.
+func runTest(name: string, body: fn(): void): void {
+    loupTestResetFail();
+    body();
+    if (loupTestDidFail()) {
+        puts("FAIL ");
+        failed += 1;
+    } else {
+        puts("ok   ");
+        passed += 1;
+    }
+    puts(name);
+    newline();
+}
+
+# ---- Capturing the console ---------------------------------------------------------
+
+var gBoardPut: fn(uint8): void = discardByte;
+var captured: buffer[uint8, 64];
+var capturedLength: int = 0;
+
+func discardByte(c: uint8): void {
+}
+
+func captureByte(c: uint8): void {
+    if (capturedLength < 64) {
+        captured[capturedLength] = c;
+        capturedLength += 1;
+    }
+}
+
+func startCapture(): void {
+    capturedLength = 0;
+    attach(captureByte);
+}
+
+# Stops capturing; true when the console received exactly `want`.
+func capturedIs(want: string): bool {
+    attach(gBoardPut);
+    var i = 0;
+    for (c in want) {
+        if (i >= capturedLength or captured[i] != (c as uint8)) {
+            return false;
+        }
+        i += 1;
+    }
+    return i == capturedLength;
+}
+
+# ---- kernel/queue -----------------------------------------------------------------
+
+var ids: Queue[uint8];
+var values: Queue[uint64];
+
+func takeId(): int {
+    var got = -1;
+    safe {
+        match ids.pop() {
+            Some(v) => { got = v as int; },
+            None => { got = -1; },
+        }
+    }
+    return got;
+}
+
+func testQueueOrder(): void {
+    safe {
+        ids.setLimit(3);
+        expectFs(ids.push(4u8), "room for the first");
+        expectFs(ids.push(5u8), "and the second");
+        expectFs(ids.push(6u8), "and the third");
+        expectFs(!ids.push(7u8), "a full queue refuses");
+    }
+    expectEqFs(ids.length(), 3, "three queued");
+    expectEqFs(ids.at(0) as int, 4, "the oldest first");
+    expectEqFs(takeId(), 4, "pop takes the oldest");
+    expectEqFs(takeId(), 5, "then the next");
+    expectEqFs(takeId(), 6, "then the last");
+    expectEqFs(takeId(), -1, "then nothing");
+    expectFs(ids.isEmpty(), "empty again");
+}
+
+# Pushing and popping past the end of the buffer wraps around it.
+func testQueueWraps(): void {
+    var popped: uint64 = 0u64;
+    var inOrder = true;
+    safe {
+        values.setLimit(4);
+        let _a = values.push(0u64);
+        let _b = values.push(1u64);
+        let _c = values.push(2u64);
+        var next: uint64 = 3u64;
+        while (next < 23u64) {
+            let _d = values.push(next);
+            match values.pop() {
+                Some(v) => {
+                    inOrder = inOrder and v == popped;
+                    popped += 1u64;
+                },
+                None => { inOrder = false; },
+            }
+            next += 1u64;
+        }
+    }
+    expectFs(inOrder, "every value comes out in push order");
+    expectEqFs(popped as int, 20, "twenty pops, two and a half laps of the buffer");
+    expectEqFs(values.length(), 3, "three left");
+    expectEqFs(values.at(0) as int, 20, "the oldest left");
+}
+
+# ---- kernel/console -----------------------------------------------------------------
+
+func testDecimal(): void {
+    startCapture();
+    putDec(0u64);
+    expectFs(capturedIs("0"), "zero is one digit");
+    startCapture();
+    putDecWidth(42u64, 5);
+    expectFs(capturedIs("   42"), "right-aligned in five columns");
+    startCapture();
+    putDec(18446744073709551615u64);
+    expectFs(capturedIs("18446744073709551615"), "the largest uint64");
+    expectEqFs(decimalWidth(1000u64), 4, "the width of 1000");
+}
+
+func testHexAndCells(): void {
+    startCapture();
+    putHex(0xBEEFu64);
+    expectFs(capturedIs("0xbeef"), "lower-case hex without leading zeros");
+    startCapture();
+    putHex(0u64);
+    expectFs(capturedIs("0x0"), "zero");
+    startCapture();
+    putCell("ab", 5);
+    putCell("cd", 2);
+    expectFs(capturedIs("ab   cd"), "cells pad to their width");
+}
+
+# ---- kernel/tasks and kernel/sched -------------------------------------------------
+
+func noop(arg: uint64): void {
+}
+
+# The board is needed for the tasks' first frames; the scheduler itself
+# never starts in this image.
+var gBoard: Platform;
+var spawned: buffer[uint64, 8];
+
+func spawnOrMinus(name: string, priority: uint64): int {
+    match spawnTask(name, priority, noop, 0u64) {
+        Ok(id) => { return id; },
+        Err(e) => { return -1; },
+    }
+}
+
+func testSpawn(): void {
+    schedInit(gBoard);
+    expectEqFs(taskCount(), 1, "idle is task 0");
+    var n = 1;
+    while (n < 7) {
+        spawned[n] = spawnOrMinus("t", PRIO_NORMAL) as uint64;
+        n += 1;
+    }
+    spawned[7] = spawnOrMinus("bg", PRIO_BACKGROUND) as uint64;
+    expectEqFs(taskCount(), 8, "seven tasks fit beside idle");
+    expectEqFs(spawned[7] as int, 7, "ids in order");
+    var full = false;
+    match spawnTask("extra", PRIO_NORMAL, noop, 0u64) {
+        Ok(id) => { full = false; },
+        Err(SpawnError.TableFull) => { full = true; },
+        Err(SpawnError.IdlePriority) => { full = false; },
+    }
+    expectFs(full, "an eighth task does not fit");
+    expectEqFs(runQueue.waiting(), 7, "every new task is queued");
+}
+
+# A state as two numbers, read through a match: what the payload of each
+# variant holds. (`==` on enum values with a payload is always false in a
+# Loup 1.26.0 freestanding build, so the tests compare the parts.)
+func kindOf(s: TaskState[Wait]): int {
+    match s {
+        TaskState.Ready => { return 0; },
+        TaskState.Running => { return 1; },
+        TaskState.Sleeping(until) => { return 2; },
+        TaskState.Blocked(w) => {
+            match w {
+                Wait.Semaphore(sem) => { return 3; },
+                Wait.Mutex(m) => { return 4; },
+                Wait.Input => { return 5; },
+            }
+        },
+        TaskState.Done => { return 6; },
+    }
+}
+
+func payloadOf(s: TaskState[Wait]): uint64 {
+    match s {
+        TaskState.Sleeping(until) => { return until; },
+        TaskState.Blocked(w) => {
+            match w {
+                Wait.Semaphore(sem) => { return sem; },
+                Wait.Mutex(m) => { return m; },
+                Wait.Input => { return 0u64; },
+            }
+        },
+        _ => { return 0u64; },
+    }
+}
+
+# setState and stateOf agree on every state.
+func testStates(): void {
+    setState(1, TaskState.Sleeping(30u64));
+    setState(2, TaskState.Blocked(Wait.Semaphore(1u64)));
+    setState(3, TaskState.Blocked(Wait.Mutex(0u64)));
+    setState(4, TaskState.Blocked(Wait.Input));
+    setState(5, TaskState.Done);
+    expectEqFs(kindOf(stateOf(1)), 2, "sleeping");
+    expectEqFs(payloadOf(stateOf(1)) as int, 30, "with its tick");
+    expectEqFs(kindOf(stateOf(2)), 3, "blocked on a semaphore");
+    expectEqFs(payloadOf(stateOf(2)) as int, 1, "which one");
+    expectEqFs(kindOf(stateOf(3)), 4, "blocked on a mutex");
+    expectEqFs(kindOf(stateOf(4)), 5, "waiting for input");
+    expectEqFs(kindOf(stateOf(5)), 6, "done");
+    expectFs(stateOf(5) == TaskState.Done, "a variant without a payload compares with ==");
+}
+
+# The longest waiter is the one that blocked first, whatever its id.
+func testLongestWaiter(): void {
+    setState(6, TaskState.Blocked(Wait.Semaphore(3u64)));
+    setState(2, TaskState.Blocked(Wait.Semaphore(3u64)));
+    expectEqFs(longestWaiter(CODE_SEMAPHORE, 3u64), 6, "first come, first woken");
+    setState(6, TaskState.Ready);
+    expectEqFs(longestWaiter(CODE_SEMAPHORE, 3u64), 2, "then the next");
+    expectEqFs(longestWaiter(CODE_SEMAPHORE, 9u64), -1, "nobody waits on 9");
+}
+
+# Empties the run queue, so a test sees only what it queues.
+func drainRunQueue(): void {
+    while (runQueue.next() >= 0) {
+    }
+}
+
+# clockTick wakes every sleeper that is due, earliest deadline first, then
+# the lowest id.
+func testWakeOrder(): void {
+    drainRunQueue();
+    let base = now();
+    setState(1, TaskState.Sleeping(base + 2u64));
+    setState(2, TaskState.Sleeping(base + 1u64));
+    setState(3, TaskState.Sleeping(base + 2u64));
+    setState(4, TaskState.Sleeping(base + 3u64));
+    clockTick();
+    clockTick();
+    expectEqFs(runQueue.waiting(), 3, "three sleepers due after two ticks");
+    expectEqFs(runQueue.next(), 2, "the earliest deadline first");
+    expectEqFs(runQueue.next(), 1, "then the lowest id of a tie");
+    expectEqFs(runQueue.next(), 3, "then the other");
+    expectEqFs(kindOf(stateOf(4)), 2, "the last still sleeps");
+    expectEqFs(codeOf(2) as int, CODE_READY as int, "a woken task is ready");
+}
+
+# A higher priority goes first, whatever the order of queueing.
+func testPriorities(): void {
+    drainRunQueue();
+    setState(7, TaskState.Ready);
+    runQueue.enqueue(7);
+    expectFs(runQueue.readyAbove(PRIO_IDLE), "a background task outranks idle");
+    expectFs(!runQueue.readyAbove(PRIO_BACKGROUND), "but not another background task");
+    setState(1, TaskState.Ready);
+    runQueue.enqueue(1);
+    expectFs(runQueue.readyAbove(PRIO_BACKGROUND), "a normal task outranks it");
+    expectFs(!runQueue.readyAbove(PRIO_NORMAL), "nothing outranks a normal task");
+    expectEqFs(runQueue.next(), 1, "the normal task first, though queued last");
+    expectEqFs(runQueue.next(), 7, "then the background one");
+    expectEqFs(runQueue.next(), -1, "then only idle is left");
+}
+
+# ---- kernel/sync --------------------------------------------------------------------
+
+var units: Semaphore;
+
+func testSemaphoreCounts(): void {
+    safe {
+        units.open("units", 2u64);
+        expectFs(units.tryDown(), "the first unit");
+        expectFs(units.tryDown(), "the second unit");
+        expectFs(!units.tryDown(), "no third");
+        units.up();
+    }
+    expectEqFs(units.value() as int, 1, "up with no waiter counts");
+}
+
+# ---- Stack guards -------------------------------------------------------------------
+
+func testGuards(): void {
+    var intact = false;
+    unsafe("raw stack memory: reads the guards of tasks that never ran") {
+        intact = guardIntact(1) and guardIntact(7);
+    }
+    expectFs(intact, "a new task's guard is intact");
+    # One word just below task 3's stack, where an overflow writes first.
+    let guardTop = stackTopOf(3) - stackBytes() - 8u64;
+    unsafe("raw stack memory: overwrites a word of task 3's guard, as an overflow would") {
+        bufSetU64(guardTop, 0, 0u64);
+        intact = guardIntact(3);
+    }
+    expectFs(!intact, "an overwritten guard is noticed");
+}
+
+pub func runAll(board: Platform, put: fn(uint8): void): uint8 {
+    gBoard = board;
+    gBoardPut = put;
+    puts(APP_NAME);
+    puts(" ");
+    puts(APP_VERSION);
+    puts(" self-test on ");
+    puts(board.arch());
+    newline();
+    runTest("queue: first in, first out, up to its limit", testQueueOrder);
+    runTest("queue: wraps around its buffer", testQueueWraps);
+    runTest("console: decimal numbers", testDecimal);
+    runTest("console: hex numbers and table cells", testHexAndCells);
+    runTest("sched: tasks spawn until the table is full", testSpawn);
+    runTest("tasks: states round-trip through the table", testStates);
+    runTest("tasks: the longest waiter is woken first", testLongestWaiter);
+    runTest("sched: sleepers wake earliest first", testWakeOrder);
+    runTest("sched: higher priorities run first", testPriorities);
+    runTest("sync: a semaphore counts its units", testSemaphoreCounts);
+    runTest("tasks: an overwritten stack guard is noticed", testGuards);
+    puts("self-test: ");
+    putDec(passed as uint64);
+    puts(" of ");
+    putDec((passed + failed) as uint64);
+    puts(" passed");
+    newline();
+    if (failed == 0) {
+        return STATUS_OK;
+    }
+    return STATUS_TEST_FAILED;
+}

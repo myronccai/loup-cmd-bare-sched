@@ -1,0 +1,28 @@
+# Tasks: bare-sched
+
+- [x] 1. Manifests for the four images, linker scripts (boot page tables, `.idt`, 2 KiB-aligned vectors), QEMU launcher
+  - _Requirements: 1.1, 6.2_
+- [x] 2. Shared console, `Queue[T]` over a fixed buffer, the `Platform` interface
+  - _Requirements: 1.1, 5.1_
+- [x] 3. Task table: `TaskState[W]`, the integer encoding, stacks from `makeBufferU64`, guards
+  - _Requirements: 2.1, 2.4, 3.6_
+- [x] 4. x86_64 context switch (naked, `@callconv("sysv64")`), task entry, first frame with `PartialInit` and a size check
+  - _Requirements: 2.2, 2.3_
+- [x] 5. Scheduler core: `RunQueue` (`@lockOrder(40)` synchronized), `dispatch`, yield, sleep, block, wake, exit, spawn
+  - _Requirements: 2.3, 3.1, 3.2, 3.6_
+- [x] 6. Clock and preemption from the timer interrupt; key input from the UART interrupt
+  - _Requirements: 3.3, 3.4, 3.5, 5.5_
+- [x] 7. Semaphores and ranked mutexes (`ItemsLock` 20, `ConsoleLock` 30) under `InterruptGuard`
+  - _Requirements: 4.1, 4.2, 4.3, 4.4_
+- [x] 8. x86_64 board: IDT and handlers, 8259, PIT, COM1, template foundation `X86Cpu` + overlay `QemuPc`, panic handler, PVH entry
+  - _Requirements: 1.2, 1.4_
+- [x] 9. Demo tasks (producers with an `onstack` batch, consumer, ticker, counter, hog) and the monitor (table, trace, keys)
+  - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5_
+- [x] 10. Schedule trace on `debug.recording`, behind an `if const` switch
+  - _Requirements: 5.5_
+- [x] 11. aarch64 board: vectors, GICv2, virtual timer (compare value), PL011, context switch (`@callconv("aapcs64")`), foundation `Arm64Cpu` + overlay `QemuVirt`
+  - _Requirements: 1.3, 2.2, 2.3_
+- [x] 12. Self-test images with `debug.assert_fs`
+  - _Requirements: 6.1_
+- [x] 13. Boot tests with `-icount`, Makefile, CI
+  - _Requirements: 6.2, 6.3, 6.4_

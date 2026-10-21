@@ -1,0 +1,13 @@
+loup-cmd-bare-sched 0.1.0 self-test on aarch64
+ok   queue: first in, first out, up to its limit
+ok   queue: wraps around its buffer
+ok   console: decimal numbers
+ok   console: hex numbers and table cells
+ok   sched: tasks spawn until the table is full
+ok   tasks: states round-trip through the table
+ok   tasks: the longest waiter is woken first
+ok   sched: sleepers wake earliest first
+ok   sched: higher priorities run first
+ok   sync: a semaphore counts its units
+ok   tasks: an overwritten stack guard is noticed
+self-test: 11 of 11 passed

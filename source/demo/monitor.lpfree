@@ -1,0 +1,299 @@
+@mode(freestanding)
+
+# The monitor task: prints the task table while the demo runs, says when
+# the demo is over, then serves keys from the serial port (the task table,
+# the schedule trace, the stack-overflow test, quit).
+#
+# Runtime: freestanding, shared by both scheduler images,
+# build/sched-x86_64.elf and build/sched-aarch64.elf (`loup build --target
+# freestanding`): no operating system, runtime library, heap or
+# exceptions. It runs as a task under the scheduler when `make boot` boots
+# each image under QEMU; tests/boot.sh waits for its lines and types the
+# keys. `make check` type-checks it with Stage0.
+#
+# Structure: describing a state; the task table; the schedule trace; the
+# keys; the monitor task itself.
+
+from appinfo import (STATUS_OK);
+from kernel.console import (putc, puts, putDec, putDecWidth, putCell, newline, spaces,
+    textWidth, decimalWidth);
+from kernel.tasks import (TaskState, Wait, PRIO_BACKGROUND, PRIO_NORMAL, taskCount,
+    nameOf, priorityOf, stateOf, runsOf, stackBytes);
+from kernel.sched import (runQueue, now, yieldNow, sleepUntil, waitKey, spawnTask,
+    spawnErrorText, haltMachine, switchCount, preemptionCount, traceLength, traceFull,
+    traceEntry);
+from kernel.sync import (consoleLock, semaphoreName, mutexName, mutexOwner, mutexWaits,
+    MUTEX_ITEMS, MUTEX_CONSOLE);
+from demo.workers import (hog, counterValue, itemsConsumed, sumConsumed);
+
+# The reports during the demo, and the tick by which every worker is done.
+const FIRST_REPORT: uint64 = 12u64;
+const SECOND_REPORT: uint64 = 60u64;
+const DEMO_END: uint64 = 110u64;
+
+# ---- Describing a state --------------------------------------------------------
+
+func priorityName(p: uint64): string {
+    if (p == PRIO_NORMAL) {
+        return "normal";
+    } else if (p == PRIO_BACKGROUND) {
+        return "background";
+    }
+    return "idle";
+}
+
+# The state column: "running", "sleeping until tick 25", "blocked on
+# semaphore free", ... Returns the width written, for the padding.
+func putState(s: TaskState[Wait]): int {
+    match s {
+        TaskState.Ready => {
+            puts("ready");
+            return 5;
+        },
+        TaskState.Running => {
+            puts("running");
+            return 7;
+        },
+        TaskState.Sleeping(until) => {
+            puts("sleeping until tick ");
+            putDec(until);
+            return 20 + decimalWidth(until);
+        },
+        TaskState.Blocked(w) => {
+            match w {
+                Wait.Semaphore(sem) => {
+                    puts("blocked on semaphore ");
+                    puts(semaphoreName(sem));
+                    return 21 + textWidth(semaphoreName(sem));
+                },
+                Wait.Mutex(m) => {
+                    puts("blocked on mutex ");
+                    puts(mutexName(m));
+                    return 17 + textWidth(mutexName(m));
+                },
+                Wait.Input => {
+                    puts("waiting for a key");
+                    return 17;
+                },
+            }
+        },
+        TaskState.Done => {
+            puts("done");
+            return 4;
+        },
+    }
+}
+
+# ---- The task table ---------------------------------------------------------------
+
+# "items free", "console held by monitor, 1 wait so far".
+func putMutex(m: int): void {
+    puts(mutexName(m as uint64));
+    let owner = mutexOwner(m);
+    if (owner < 0) {
+        puts(" free");
+    } else {
+        puts(" held by ");
+        puts(nameOf(owner));
+    }
+    let waits = mutexWaits(m);
+    if (waits > 0u64) {
+        puts(", ");
+        putDec(waits);
+        if (waits == 1u64) {
+            puts(" wait so far");
+        } else {
+            puts(" waits so far");
+        }
+    }
+}
+
+## Prints the table, one row per task, holding the console lock so no other
+## task's line lands inside it. The monitor yields after every row: a long
+## report must not keep the other tasks waiting, and while it yields, a task
+## that wants the console blocks on the console lock, which the table then
+## shows.
+func printTable(title: string): void {
+    consoleLock.acquire();
+    puts(title);
+    puts(" at tick ");
+    putDec(now());
+    puts(": ");
+    putDec(taskCount() as uint64);
+    puts(" tasks, ");
+    putDec(runQueue.waiting() as uint64);
+    puts(" queued to run");
+    newline();
+    puts("  id  task     priority    state                         runs");
+    newline();
+    var id = 0;
+    while (id < taskCount()) {
+        putDecWidth(id as uint64, 4);
+        spaces(2);
+        putCell(nameOf(id), 9);
+        putCell(priorityName(priorityOf(id)), 12);
+        let width = putState(stateOf(id));
+        spaces(30 - width);
+        putDecWidth(runsOf(id), 4);
+        newline();
+        yieldNow();
+        id += 1;
+    }
+    puts("  mutexes: ");
+    putMutex(MUTEX_ITEMS);
+    puts("; ");
+    putMutex(MUTEX_CONSOLE);
+    newline();
+    consoleLock.release();
+}
+
+# ---- The schedule trace ----------------------------------------------------------
+
+# Prints the trace with one line per tick at which normal-priority tasks
+# got the CPU, in the order they got it, eight names to a line, then the
+# count.
+func printTrace(): void {
+    let count = traceLength();
+    consoleLock.acquire();
+    puts("schedule, from the debug.recording trace:");
+    newline();
+    var i: uint64 = 0u64;
+    var lineTick: uint64 = 0u64;
+    var onLine = 0;
+    while (i < count) {
+        let entry = traceEntry(i);
+        let at = entry.tick;
+        if (i == 0u64 or at != lineTick or onLine == 8) {
+            if (i > 0u64) {
+                newline();
+            }
+            if (i > 0u64 and at == lineTick) {
+                spaces(12);
+            } else {
+                puts("  tick ");
+                putDecWidth(at, 3);
+                puts(":");
+            }
+            lineTick = at;
+            onLine = 0;
+        }
+        putc(0x20u8);
+        puts(nameOf(entry.value));
+        onLine += 1;
+        i += 1u64;
+    }
+    if (count > 0u64) {
+        newline();
+    }
+    puts("  ");
+    putDec(count);
+    puts(" switches to normal-priority tasks");
+    if (traceFull()) {
+        puts("; the trace is full, later ones were not recorded");
+    }
+    newline();
+    consoleLock.release();
+}
+
+# ---- Keys ---------------------------------------------------------------------------
+
+func printKeys(): void {
+    puts("keys: p task table, t schedule trace, o overflow a stack, q quit");
+    newline();
+}
+
+# A key as the user would name it: 'x' when printable, else its code.
+func putKey(key: uint8): void {
+    if (key >= 0x20u8 and key < 0x7Fu8) {
+        putc(0x27u8);
+        putc(key);
+        putc(0x27u8);
+    } else {
+        puts("code ");
+        putDec(key as uint64);
+    }
+}
+
+func startHog(): void {
+    match spawnTask("hog", PRIO_NORMAL, hog, 1u64) {
+        Ok(id) => {
+            consoleLock.acquire();
+            puts("monitor: started hog as task ");
+            putDec(id as uint64);
+            puts(", which recurses past its ");
+            putDec(stackBytes() / 1024u64);
+            puts(" KiB stack");
+            newline();
+            consoleLock.release();
+        },
+        Err(e) => {
+            consoleLock.acquire();
+            puts("monitor: cannot start hog: ");
+            puts(spawnErrorText(e));
+            newline();
+            consoleLock.release();
+        },
+    }
+}
+
+func quit(): void {
+    consoleLock.acquire();
+    puts("quit at tick ");
+    putDec(now());
+    puts(": ");
+    putDec(switchCount());
+    puts(" switches, ");
+    putDec(preemptionCount());
+    puts(" preemptions, counter at ");
+    putDec(counterValue());
+    newline();
+    consoleLock.release();
+    haltMachine(STATUS_OK);
+}
+
+func handleKey(key: uint8): void {
+    if (key == 0x70u8) {                    # p
+        printTable("tasks");
+    } else if (key == 0x74u8) {             # t
+        printTrace();
+    } else if (key == 0x6Fu8) {             # o
+        startHog();
+    } else if (key == 0x71u8) {             # q
+        quit();
+    } else if (key == 0x0Du8 or key == 0x0Au8) {
+        # Enter: nothing to do.
+    } else {
+        consoleLock.acquire();
+        puts("key ");
+        putKey(key);
+        puts(" does nothing; ");
+        printKeys();
+        consoleLock.release();
+    }
+}
+
+# ---- The task ------------------------------------------------------------------------
+
+## The monitor's entry: two reports while the workers run, the result once
+## they are done, then keys until `q`.
+pub func monitor(arg: uint64): void {
+    sleepUntil(FIRST_REPORT);
+    printTable("monitor");
+    sleepUntil(SECOND_REPORT);
+    printTable("monitor");
+    sleepUntil(DEMO_END);
+    printTable("monitor");
+    consoleLock.acquire();
+    puts("demo finished at tick ");
+    putDec(now());
+    puts(": ");
+    putDec(itemsConsumed());
+    puts(" items consumed, sum ");
+    putDec(sumConsumed());
+    newline();
+    printKeys();
+    consoleLock.release();
+    while (true) {
+        handleKey(waitKey());
+    }
+}

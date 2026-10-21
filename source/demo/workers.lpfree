@@ -1,0 +1,226 @@
+@mode(freestanding)
+
+# The demo's workers: two producers and a consumer sharing a bounded queue,
+# a ticker that sleeps on the timer, a background counter that never gives
+# up the CPU, and a hog that overruns its stack on request.
+#
+# Runtime: freestanding, shared by both scheduler images,
+# build/sched-x86_64.elf and build/sched-aarch64.elf (`loup build --target
+# freestanding`): no operating system, runtime library, heap or
+# exceptions. Each function here is a task's entry, run on the task's own
+# stack by the scheduler. `make boot` boots each image under QEMU and
+# compares what the tasks print with tests/expected/; `make check`
+# type-checks it with Stage0.
+#
+# Structure: the shared queue and its semaphores; the producers and the
+# consumer (the classic bounded buffer: `free` counts empty places,
+# `filled` counts items, ItemsLock guards the queue itself); the ticker;
+# the counter; the hog.
+
+from kernel.console import (puts, putDec, newline);
+from kernel.queue import (Queue);
+from kernel.sched import (currentTask, now, yieldNow, sleepUntil);
+from kernel.sync import (Semaphore, itemsLock, consoleLock);
+from kernel.tasks import (nameOf, guardIntact);
+
+pub const QUEUE_LIMIT: int = 4;
+pub const BATCH: int = 6;
+
+# The consumer takes an item every CONSUME_EVERY ticks: slower than the
+# producers, so the queue fills and they wait for room.
+pub const CONSUME_EVERY: uint64 = 3u64;
+
+var items: Queue[uint64];
+var free: Semaphore;
+var filled: Semaphore;
+
+var consumed: uint64 = 0u64;
+var consumedSum: uint64 = 0u64;
+var counted: uint64 = 0u64;
+
+## Sets up the queue and its semaphores, before the workers are spawned.
+pub func setUpWorkers(): void {
+    safe {
+        items.setLimit(QUEUE_LIMIT);
+        free.open("free", QUEUE_LIMIT as uint64);
+        filled.open("filled", 0u64);
+    }
+}
+
+pub func itemsConsumed(): uint64 {
+    return consumed;
+}
+
+pub func sumConsumed(): uint64 {
+    return consumedSum;
+}
+
+pub func counterValue(): uint64 {
+    return atomicLoadU64(addressOf(counted), 5);
+}
+
+# "prod-a: put 3 (queue 2/4)". Called with the console lock held.
+func report(what: string, value: uint64): void {
+    puts(nameOf(currentTask()));
+    puts(what);
+    putDec(value);
+    puts(" (queue ");
+    putDec(items.length() as uint64);
+    puts("/");
+    putDec(items.capacity() as uint64);
+    puts(")");
+}
+
+# ---- Producers and consumer -----------------------------------------------------
+
+func put(value: uint64): void {
+    safe {
+        free.down();
+    }
+    itemsLock.acquire();
+    safe {
+        let _ = items.push(value);
+    }
+    consoleLock.acquire();
+    report(": put ", value);
+    newline();
+    consoleLock.release();
+    itemsLock.release();
+    safe {
+        filled.up();
+    }
+}
+
+## A producer: puts `step`, 2 * `step`, ... BATCH * `step` into the queue,
+## yielding to the other tasks after each item.
+pub func producer(step: uint64): void {
+    # prod-a and prod-b run this function at the same time, taking turns at
+    # every yield and every wait, so the batch must live in each task's own
+    # frame. Without onstack, Loup puts an aggregate local in one static
+    # block per function, and the two producers would share one batch.
+    onstack var batch: buffer[uint64, 6];
+    var k = 0;
+    while (k < BATCH) {
+        batch[k] = step * ((k + 1) as uint64);
+        k += 1;
+    }
+    k = 0;
+    while (k < BATCH) {
+        put(batch[k]);
+        yieldNow();
+        k += 1;
+    }
+    consoleLock.acquire();
+    puts(nameOf(currentTask()));
+    puts(": done");
+    newline();
+    consoleLock.release();
+}
+
+## The consumer: takes `total` items, one every CONSUME_EVERY ticks, and
+## adds them up.
+pub func consumer(total: uint64): void {
+    var taken: uint64 = 0u64;
+    while (taken < total) {
+        safe {
+            filled.down();
+        }
+        itemsLock.acquire();
+        var value: uint64 = 0u64;
+        safe {
+            match items.pop() {
+                Some(v) => { value = v; },
+                None => { unreachable; },
+            }
+        }
+        consumedSum += value;
+        consumed += 1u64;
+        # The queue stays locked while the line is printed, so the length
+        # shown is the one this take left: items (20), then console (30).
+        consoleLock.acquire();
+        report(": got ", value);
+        puts(", sum ");
+        putDec(consumedSum);
+        newline();
+        consoleLock.release();
+        itemsLock.release();
+        safe {
+            free.up();
+        }
+        taken += 1u64;
+        sleepUntil(taken * CONSUME_EVERY);
+    }
+    consoleLock.acquire();
+    puts("cons: done, ");
+    putDec(consumed);
+    puts(" items, sum ");
+    putDec(consumedSum);
+    newline();
+    consoleLock.release();
+}
+
+# ---- Ticker ---------------------------------------------------------------------------
+
+## Wakes at ticks `period`, 2 * `period`, 3 * `period` and 4 * `period`.
+pub func ticker(period: uint64): void {
+    var beat: uint64 = 1u64;
+    while (beat <= 4u64) {
+        sleepUntil(beat * period);
+        consoleLock.acquire();
+        puts("ticker: tick ");
+        putDec(now());
+        puts(", beat ");
+        putDec(beat);
+        puts(" of 4");
+        newline();
+        consoleLock.release();
+        beat += 1u64;
+    }
+}
+
+# ---- Counter ---------------------------------------------------------------------------
+
+## Counts for ever without yielding. It runs at background priority, so it
+## only gets the CPU when nothing else is ready, and the timer interrupt
+## takes the CPU back whenever a task wakes up.
+pub func counter(start: uint64): void {
+    var n = start;
+    while (true) {
+        n += 1u64;
+        atomicStoreU64(addressOf(counted), n, 5);
+    }
+}
+
+# ---- Hog -------------------------------------------------------------------------------
+
+# Each level takes a 256-byte buffer of its frame, and the frame's other
+# slots. The recursion goes on until a level's frame reaches the guard
+# below the stack, as an unbounded recursion would, and stops there, so the
+# overrun stays inside the guard. Returns how deep it went.
+func burn(level: uint64): uint64 {
+    onstack var scratch: buffer[uint64, 32];
+    var i = 0;
+    while (i < 32) {
+        scratch[i] = level + (i as uint64);
+        i += 1;
+    }
+    var intact = true;
+    unsafe("raw stack memory: reads this task's own guard") {
+        intact = guardIntact(currentTask());
+    }
+    if (!intact) {
+        return scratch[0];
+    }
+    return burn(level + 1u64);
+}
+
+## Recurses until its stack runs out, then gives up the CPU: the scheduler
+## finds the guard overwritten and panics.
+pub func hog(arg: uint64): void {
+    let _deepest = burn(arg);
+    consoleLock.acquire();
+    puts("hog: deep enough to write into the guard below its stack; yielding");
+    newline();
+    consoleLock.release();
+    yieldNow();
+}

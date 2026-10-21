@@ -1,0 +1,23 @@
+@mode(freestanding)
+
+# Leaving QEMU on x86_64: the isa-debug-exit device (scripts/qemu.sh adds
+# it at I/O port 0xF4) makes QEMU exit with (value << 1) | 1.
+#
+# Runtime: freestanding, x86_64 only. The x86 board module imports it, so
+# `make build` compiles it into build/sched-x86_64.elf and
+# build/selftest-x86_64.elf (`loup build --target freestanding --arch
+# x86_64`); the aarch64 images never contain it. It runs when `make boot`
+# boots those images on QEMU's pc machine; `make check` type-checks it with
+# Stage0.
+
+from x86.ports import (outb);
+
+## Exits with QEMU status 33 for STATUS_OK (0x10), 35 for STATUS_TEST_FAILED
+## and 37 for STATUS_PANIC. Without the device, the CPU halts for good.
+@interruptSafe
+pub func qemuExit(status: uint8): void {
+    outb(0xF4u16, 0x10u8 | status);
+    while (true) {
+        asm { "cli" "hlt" }
+    }
+}

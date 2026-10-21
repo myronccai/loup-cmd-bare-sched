@@ -1,0 +1,64 @@
+@mode(freestanding)
+
+# The GICv2 interrupt controller of QEMU's virt machine. The distributor
+# decides which interrupts reach which core; each core's CPU interface
+# hands it the highest-priority one and is told when it is done.
+#
+# Runtime: freestanding, aarch64 only. The arm board module imports it, so
+# `make build` compiles it into build/sched-aarch64.elf and
+# build/selftest-aarch64.elf (`loup build --target freestanding --arch
+# aarch64 boards/...`); the x86_64 images never contain it. It runs when
+# `make boot` boots those images on QEMU's virt machine (Cortex-A53);
+# `make check` type-checks it with Stage0 from boards/aarch64.
+
+const DISTRIBUTOR: uint64 = 0x08000000u64;
+const CPU_INTERFACE: uint64 = 0x08010000u64;
+
+pub const INTID_TIMER: uint64 = 27u64;      # the EL1 virtual timer, private to the core
+pub const INTID_UART: uint64 = 33u64;       # the PL011, shared peripheral 1
+pub const INTID_SPURIOUS: uint64 = 1023u64; # "nothing pending" from the acknowledge
+
+@interruptSafe
+func read32(address: uint64): uint32 {
+    return Volatile[uint32, Little].at(address).read();
+}
+
+@interruptSafe
+func write32(address: uint64, value: uint32): void {
+    Volatile[uint32, Little].at(address).write(value);
+}
+
+# Enables one interrupt in the distributor. A shared peripheral interrupt
+# (INTID 32 and up) must also be sent to a core: core 0.
+func enableInterrupt(intid: uint64): void {
+    let enable = DISTRIBUTOR + 0x100u64 + (intid / 32u64) * 4u64;     # GICD_ISENABLERn
+    write32(enable, ((1u64 << (intid % 32u64)) & 0xFFFFFFFFu64) as uint32);
+    if (intid >= 32u64) {
+        let targets = DISTRIBUTOR + 0x800u64 + (intid / 4u64) * 4u64; # GICD_ITARGETSRn
+        let shift = (intid % 4u64) * 8u64;
+        let old = read32(targets) as uint64;
+        write32(targets, ((old | (1u64 << shift)) & 0xFFFFFFFFu64) as uint32);
+    }
+}
+
+## Turns the distributor and this core's interface on, lets every priority
+## through, and enables the timer and the UART.
+pub func gicStart(): void {
+    write32(DISTRIBUTOR + 0x000u64, 1u32);         # GICD_CTLR: forward interrupts
+    enableInterrupt(INTID_TIMER);
+    enableInterrupt(INTID_UART);
+    write32(CPU_INTERFACE + 0x004u64, 0xF0u32);    # GICC_PMR: let every priority through
+    write32(CPU_INTERFACE + 0x000u64, 1u32);       # GICC_CTLR: signal interrupts
+}
+
+## Acknowledges the pending interrupt (GICC_IAR): its INTID is in bits 0-9.
+@interruptSafe
+pub func gicAcknowledge(): uint64 {
+    return read32(CPU_INTERFACE + 0x00Cu64) as uint64;
+}
+
+## Ends an interrupt (GICC_EOIR) with the value the acknowledge returned.
+@interruptSafe
+pub func gicEnd(acknowledged: uint64): void {
+    write32(CPU_INTERFACE + 0x010u64, (acknowledged & 0xFFFFFFFFu64) as uint32);
+}

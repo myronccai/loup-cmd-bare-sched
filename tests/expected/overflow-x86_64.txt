@@ -1,0 +1,73 @@
+loup-cmd-bare-sched 0.1.0 on x86_64 (QEMU pc)
+cpu: IDT loaded, 7 gates
+pic: IRQs at vectors 32-47, timer and COM1 unmasked
+com1: receive interrupt on
+sched: 7 tasks on 16 KiB stacks; the timer preempts the background task
+pit: 100 Hz (divisor 11932)
+prod-a: put 1 (queue 1/4)
+prod-b: put 10 (queue 2/4)
+cons: got 1 (queue 1/4), sum 1
+prod-a: put 2 (queue 2/4)
+prod-b: put 20 (queue 3/4)
+prod-a: put 3 (queue 4/4)
+cons: got 10 (queue 3/4), sum 11
+prod-b: put 30 (queue 4/4)
+cons: got 2 (queue 3/4), sum 13
+prod-a: put 4 (queue 4/4)
+cons: got 20 (queue 3/4), sum 33
+prod-b: put 40 (queue 4/4)
+monitor at tick 12: 7 tasks, 2 queued to run
+  id  task     priority    state                         runs
+   0  idle     idle        ready                            0
+   1  monitor  normal      running                          3
+   2  prod-a   normal      blocked on semaphore free        5
+   3  prod-b   normal      blocked on semaphore free        5
+   4  cons     normal      blocked on mutex console         5
+   5  ticker   normal      sleeping until tick 25           1
+   6  counter  background  ready                            N
+  mutexes: items held by cons; console held by monitor, 1 wait so far
+cons: got 3 (queue 3/4), sum 36
+prod-a: put 5 (queue 4/4)
+cons: got 30 (queue 3/4), sum 66
+prod-b: put 50 (queue 4/4)
+cons: got 4 (queue 3/4), sum 70
+prod-a: put 6 (queue 4/4)
+prod-a: done
+cons: got 40 (queue 3/4), sum 110
+prod-b: put 60 (queue 4/4)
+prod-b: done
+cons: got 5 (queue 3/4), sum 115
+ticker: tick 25, beat 1 of 4
+cons: got 50 (queue 2/4), sum 165
+cons: got 6 (queue 1/4), sum 171
+cons: got 60 (queue 0/4), sum 231
+cons: done, 12 items, sum 231
+ticker: tick 50, beat 2 of 4
+monitor at tick 60: 7 tasks, 1 queued to run
+  id  task     priority    state                         runs
+   0  idle     idle        ready                            0
+   1  monitor  normal      running                          4
+   2  prod-a   normal      done                             7
+   3  prod-b   normal      done                             7
+   4  cons     normal      done                            14
+   5  ticker   normal      sleeping until tick 75           3
+   6  counter  background  ready                           N
+  mutexes: items free; console held by monitor, 1 wait so far
+ticker: tick 75, beat 3 of 4
+ticker: tick 100, beat 4 of 4
+monitor at tick 110: 7 tasks, 1 queued to run
+  id  task     priority    state                         runs
+   0  idle     idle        ready                            0
+   1  monitor  normal      running                          5
+   2  prod-a   normal      done                             7
+   3  prod-b   normal      done                             7
+   4  cons     normal      done                            14
+   5  ticker   normal      done                             5
+   6  counter  background  ready                           N
+  mutexes: items free; console held by monitor, 1 wait so far
+demo finished at tick 110: 12 items consumed, sum 231
+keys: p task table, t schedule trace, o overflow a stack, q quit
+monitor: started hog as task 7, which recurses past its 16 KiB stack
+hog: deep enough to write into the guard below its stack; yielding
+PANIC: reached an `unreachable` expression at kernel/sched.lpfree:144
+  stack overflow: task 7 (hog) wrote past the end of its 16 KiB stack, into its guard

@@ -1,0 +1,58 @@
+@mode(freestanding)
+
+# The EL1 virtual timer of the Arm generic timer: it raises INTID 27 when
+# the virtual count (CNTVCT_EL0, running at CNTFRQ_EL0 Hz) reaches the
+# compare value (CNTV_CVAL_EL0).
+#
+# Runtime: freestanding, aarch64 only. The arm board module imports it, so
+# `make build` compiles it into build/sched-aarch64.elf and
+# build/selftest-aarch64.elf (`loup build --target freestanding --arch
+# aarch64 boards/...`); the x86_64 images never contain it. It runs when
+# `make boot` boots those images on QEMU's virt machine (Cortex-A53);
+# `make check` type-checks it with Stage0 from boards/aarch64.
+#
+# The compare value is advanced by exactly one period on every interrupt,
+# not set from the current count, so a late interrupt does not shift every
+# tick after it.
+
+var period: uint64 = 0u64;
+
+pub func timerFrequency(): uint64 {
+    var hz: uint64 = 0u64;
+    asm { "mrs x0, cntfrq_el0" out: hz = "=x0" clobbers: [] }
+    return hz;
+}
+
+@interruptSafe
+func setCompare(value: uint64): void {
+    asm { "msr cntv_cval_el0, x0" "isb" in: "x0" = value clobbers: [] }
+}
+
+@interruptSafe
+func readCompare(): uint64 {
+    var value: uint64 = 0u64;
+    asm { "mrs x0, cntv_cval_el0" out: value = "=x0" clobbers: [] }
+    return value;
+}
+
+func readCount(): uint64 {
+    var value: uint64 = 0u64;
+    asm { "isb" "mrs x0, cntvct_el0" out: value = "=x0" clobbers: [] }
+    return value;
+}
+
+## Starts the timer at `hz` interrupts a second; returns the period in
+## counts.
+pub func timerStart(hz: uint64): uint64 {
+    period = timerFrequency() / hz;
+    setCompare(readCount() + period);
+    # CNTV_CTL_EL0: enabled (bit 0), interrupt not masked (bit 1 clear).
+    asm { "msr cntv_ctl_el0, x0" "isb" in: "x0" = 1u64 clobbers: [] }
+    return period;
+}
+
+## From the interrupt handler: the next compare value, one period on.
+@interruptSafe
+pub func timerRearm(): void {
+    setCompare(readCompare() + period);
+}

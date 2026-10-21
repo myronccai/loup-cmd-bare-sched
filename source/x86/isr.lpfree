@@ -1,0 +1,177 @@
+@mode(freestanding)
+
+# The x86_64 interrupt and exception handlers, and their installation.
+#
+# Runtime: freestanding, x86_64 only. The x86 board module imports it, so
+# `make build` compiles it into build/sched-x86_64.elf and
+# build/selftest-x86_64.elf (`loup build --target freestanding --arch
+# x86_64`); the aarch64 images never contain it. It runs when `make boot`
+# boots those images on QEMU's pc machine; `make check` type-checks it with
+# Stage0.
+# Structure: the device interrupts (the timer, COM1, the 8259's spurious
+# IRQ 7), the faults, then installHandlers. Each handler is an @interrupt
+# function: the compiler wraps the body in a trampoline that saves the
+# registers a call may clobber and returns with iretq. The device handlers
+# acknowledge the interrupt first and call the scheduler last: it may
+# switch to another task, and this handler finishes only when the
+# interrupted task is resumed.
+
+from x86.idt import (InterruptFrame, setGate);
+from x86.chipset import (IRQ_BASE, IRQ_TIMER, IRQ_COM1, IRQ_SPURIOUS, endOfInterrupt);
+from x86.com1 import (com1HasByte, com1Take);
+from kernel.sched import (clockTick, keyArrived, preemptIfNeeded);
+from kernel.console import (puts, putDec, putHex, newline);
+
+# ---- Devices ------------------------------------------------------------------
+
+@interrupt(arch: "x86_64", has_error_code: false)
+func isrTimer(frame: borrow InterruptFrame): void {
+    endOfInterrupt();
+    clockTick();
+    preemptIfNeeded();
+}
+
+# Every byte that has arrived; reading a byte clears the UART's interrupt.
+@interrupt(arch: "x86_64", has_error_code: false)
+func isrCom1(frame: borrow InterruptFrame): void {
+    while (com1HasByte()) {
+        keyArrived(com1Take());
+    }
+    endOfInterrupt();
+    preemptIfNeeded();
+}
+
+# The 8259 raises IRQ 7 when a line drops before the CPU answers. It must
+# not be acknowledged, so the handler is a bare iretq.
+@naked
+@unsafe("naked: an interrupt entry that touches no register and returns at once")
+func isrSpurious(): void {
+    asm { "iretq" }
+}
+
+# ---- Faults -------------------------------------------------------------------
+
+# The fault that stopped the kernel: its vector + 1 (0: none), the error
+# code, the instruction and, for a page fault, the address (cr2).
+var faultVector: uint64 = 0u64;
+var faultCode: uint64 = 0u64;
+var faultRip: uint64 = 0u64;
+var faultAddress: uint64 = 0u64;
+
+@interruptSafe
+func recordFault(vector: uint64, code: uint64, rip: uint64, address: uint64): void {
+    faultCode = code;
+    faultRip = rip;
+    faultAddress = address;
+    faultVector = vector + 1u64;
+}
+
+@interruptSafe
+func readCr2(): uint64 {
+    var a: uint64 = 0u64;
+    asm { "mov rax, cr2" out: a = "=a" clobbers: [] }
+    return a;
+}
+
+# A fault cannot be resumed: each handler records it and panics
+# (`unreachable`; panic = "custom" calls the board's @panic_handler).
+
+@interrupt(arch: "x86_64", has_error_code: false)
+func isrInvalidOpcode(frame: borrow InterruptFrame): void {
+    recordFault(6u64, 0u64, frame.rip, 0u64);
+    unreachable;
+}
+
+@interrupt(arch: "x86_64", has_error_code: true)
+func isrDoubleFault(frame: borrow InterruptFrame, error: uint64): void {
+    recordFault(8u64, error, frame.rip, 0u64);
+    unreachable;
+}
+
+@interrupt(arch: "x86_64", has_error_code: true)
+func isrProtectionFault(frame: borrow InterruptFrame, error: uint64): void {
+    recordFault(13u64, error, frame.rip, 0u64);
+    unreachable;
+}
+
+@interrupt(arch: "x86_64", has_error_code: true)
+func isrPageFault(frame: borrow InterruptFrame, error: uint64): void {
+    recordFault(14u64, error, frame.rip, readCr2());
+    unreachable;
+}
+
+## For the panic handler: the fault, if one caused the panic.
+pub func explainFault(): void {
+    if (faultVector == 0u64) {
+        return;
+    }
+    puts("  cpu fault: vector ");
+    putDec(faultVector - 1u64);
+    puts(", error ");
+    putHex(faultCode);
+    puts(", rip ");
+    putHex(faultRip);
+    if (faultVector == 15u64) {
+        puts(", address ");
+        putHex(faultAddress);
+    }
+    newline();
+}
+
+# ---- Installation -------------------------------------------------------------
+
+# The handlers' addresses come from lea: addressOf takes variables only. The
+# symbol of an @interrupt function is its trampoline.
+func addressOfTimer(): uint64 {
+    var a: uint64 = 0u64;
+    asm { "lea rax, [rip + isrTimer]" out: a = "=a" clobbers: [] }
+    return a;
+}
+
+func addressOfCom1(): uint64 {
+    var a: uint64 = 0u64;
+    asm { "lea rax, [rip + isrCom1]" out: a = "=a" clobbers: [] }
+    return a;
+}
+
+func addressOfSpurious(): uint64 {
+    var a: uint64 = 0u64;
+    asm { "lea rax, [rip + isrSpurious]" out: a = "=a" clobbers: [] }
+    return a;
+}
+
+func addressOfInvalidOpcode(): uint64 {
+    var a: uint64 = 0u64;
+    asm { "lea rax, [rip + isrInvalidOpcode]" out: a = "=a" clobbers: [] }
+    return a;
+}
+
+func addressOfDoubleFault(): uint64 {
+    var a: uint64 = 0u64;
+    asm { "lea rax, [rip + isrDoubleFault]" out: a = "=a" clobbers: [] }
+    return a;
+}
+
+func addressOfProtectionFault(): uint64 {
+    var a: uint64 = 0u64;
+    asm { "lea rax, [rip + isrProtectionFault]" out: a = "=a" clobbers: [] }
+    return a;
+}
+
+func addressOfPageFault(): uint64 {
+    var a: uint64 = 0u64;
+    asm { "lea rax, [rip + isrPageFault]" out: a = "=a" clobbers: [] }
+    return a;
+}
+
+## Fills the gates this kernel uses; an exception at any other vector finds
+## an empty gate and escalates to a double fault.
+pub func installHandlers(): void {
+    setGate(6, addressOfInvalidOpcode());
+    setGate(8, addressOfDoubleFault());
+    setGate(13, addressOfProtectionFault());
+    setGate(14, addressOfPageFault());
+    setGate(IRQ_BASE + IRQ_TIMER, addressOfTimer());
+    setGate(IRQ_BASE + IRQ_COM1, addressOfCom1());
+    setGate(IRQ_BASE + IRQ_SPURIOUS, addressOfSpurious());
+}

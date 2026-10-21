@@ -1,0 +1,74 @@
+@mode(freestanding)
+
+# The PC's interrupt controllers (a cascaded pair of 8259s) and its
+# interval timer (an 8254, channel 0 on IRQ 0).
+#
+# Runtime: freestanding, x86_64 only. The x86 board module imports it, so
+# `make build` compiles it into build/sched-x86_64.elf and
+# build/selftest-x86_64.elf (`loup build --target freestanding --arch
+# x86_64`); the aarch64 images never contain it. It runs when `make boot`
+# boots those images on QEMU's pc machine; `make check` type-checks it with
+# Stage0.
+
+from x86.ports import (outb);
+
+## The vector of IRQ 0 once the 8259s are reprogrammed: at reset they use
+## vectors 8-15, which the CPU's own exceptions occupy.
+pub const IRQ_BASE: int = 32;
+pub const IRQ_TIMER: int = 0;
+pub const IRQ_COM1: int = 4;
+pub const IRQ_SPURIOUS: int = 7;
+
+const PRIMARY: uint16 = 0x20u16;
+const SECONDARY: uint16 = 0xA0u16;
+const END_OF_INTERRUPT: uint8 = 0x20u8;
+
+## Reprograms both controllers to deliver IRQs 0-15 at vectors 32-47, then
+## masks every line except IRQ 0 (the timer) and IRQ 4 (COM1).
+pub func remapPics(): void {
+    # ICW1: start initialization; ICW4 follows.
+    outb(PRIMARY, 0x11u8);
+    outb(SECONDARY, 0x11u8);
+    # ICW2: the vector of each controller's first line.
+    outb(PRIMARY + 1u16, IRQ_BASE as uint8);
+    outb(SECONDARY + 1u16, (IRQ_BASE + 8) as uint8);
+    # ICW3: the secondary hangs off the primary's line 2.
+    outb(PRIMARY + 1u16, 0x04u8);
+    outb(SECONDARY + 1u16, 0x02u8);
+    # ICW4: 8086 mode.
+    outb(PRIMARY + 1u16, 0x01u8);
+    outb(SECONDARY + 1u16, 0x01u8);
+    # The masks: a set bit silences a line.
+    let open = (1u64 << (IRQ_TIMER as uint64)) | (1u64 << (IRQ_COM1 as uint64));
+    outb(PRIMARY + 1u16, (0xFFu64 ^ open) as uint8);
+    outb(SECONDARY + 1u16, 0xFFu8);
+}
+
+## Tells the primary controller the current interrupt is handled. Both of
+## this kernel's IRQs are on the primary.
+@interruptSafe
+pub func endOfInterrupt(): void {
+    outb(PRIMARY, END_OF_INTERRUPT);
+}
+
+# The 8254 counts down from a divisor at 1,193,182 Hz and raises IRQ 0 at
+# zero. Evaluated by the compiler: no division is left in the image.
+# (Stage0's const evaluator refuses a parenthesized expression, hence the
+# local.)
+const PIT_INPUT_HZ: uint64 = 1_193_182u64;
+
+const func pitDivisor(hz: uint64): uint64 {
+    let rounded = PIT_INPUT_HZ + hz / 2u64;
+    return rounded / hz;
+}
+
+# 100 Hz is the scheduler's TICK_HZ. A const func cannot take an imported
+# constant in Loup 1.26.0, so the rate is repeated here.
+pub const PIT_DIVISOR: uint64 = pitDivisor(100u64);
+
+## Channel 0 in mode 2 (rate generator), divisor low byte then high byte.
+pub func startPit(divisor: uint64): void {
+    outb(0x43u16, 0x34u8);
+    outb(0x40u16, (divisor & 0xFFu64) as uint8);
+    outb(0x40u16, ((divisor >> 8u64) & 0xFFu64) as uint8);
+}

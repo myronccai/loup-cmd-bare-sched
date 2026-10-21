@@ -1,7 +1,11 @@
 # AGENTS.md
 
-This repository is a GitHub template for building a command-line application
-in the Loup programming language. The program is built as a native executable.
+This repository is `loup-cmd-bare-sched`, a task scheduler on bare metal,
+in the loup-cmd series of Loup example applications. It is `freestanding`
+Loup (`.lpfree`): no operating system, no heap, no exceptions. It is built
+for two boards (x86-64 on QEMU `pc`, AArch64 on QEMU `virt`), each as a
+scheduler image and a self-test image, and tested by booting the images
+under QEMU, waiting for their output and typing keys.
 
 ## Skills
 
@@ -9,103 +13,132 @@ in the Loup programming language. The program is built as a native executable.
 |-------|----------|-------------|
 | `loup-programmer` | [skills/loup-programmer/SKILL.md](skills/loup-programmer/SKILL.md) | Writing, reviewing, debugging or explaining Loup code: `.lpscr`, `.loup`, `.lphc`, `.lpweb` or `.lpfree` source files, `.lppkg` manifests, `@mode(...)` directives, or the `loup` / `loup-bootstrap` commands. |
 
-Read `skills/loup-programmer/SKILL.md` before writing or changing any Loup code
-in this repository. It links to detailed references under
-`skills/loup-programmer/references/` for syntax, types and ownership, execution
-modes and projects, errors and diagnostics, the standard library, and common
-mistakes. Load those only as needed.
+Read `skills/loup-programmer/SKILL.md` and
+`skills/loup-programmer/references/freestanding.md` before writing or
+changing any Loup code in this repository. Load the other references only as
+needed.
 
 ## Code layout
 
 ```text
 .
-├── package.lppkg                # Loup manifest: name, version, toolchain, [build] entry, [test] pattern
-├── Makefile                     # run, check, test, build, ci, clean
-├── LICENSE                      # MIT license (copyright Code Craft AI LLC)
-├── source/                      # all Loup code; modules import each other by path from here
-│   ├── main.loup                # entry point: func main() calls run(runtime.args())
-│   ├── appinfo.loup             # APP_NAME, APP_VERSION, APP_SUMMARY, exit statuses
-│   ├── cli/
-│   │   ├── args.loup            # struct Options, parse_args()
-│   │   ├── usage.loup           # usage(), version_line()
-│   │   └── app.loup             # run(), dispatch(): routes commands, maps errors to exit statuses
-│   └── commands/                # one module per command
-│       └── hello.loup           # sample command: run_hello()
-├── tests/                       # tests: <module>_test.loup files with func test_*(): void
-│   ├── app_test.loup
-│   ├── args_test.loup
-│   └── hello_test.loup
-├── specs/                       # feature specs: <feature>/requirements.md, design.md, tasks.md
-│   ├── README.md
-│   └── command-line-interface/
-├── skills/loup-programmer/      # the Loup skill and its references
-├── .github/workflows/ci.yml     # installs Loup and runs `make ci`
-└── build/                       # build output (git-ignored)
+├── package.lppkg                    # x86_64 scheduler: [build] entry/arch/panic, [linker], [freestanding] (rawpoke = "unsafe-only")
+├── boards/
+│   ├── aarch64/package.lppkg        # aarch64 scheduler; paths relative to its directory
+│   ├── selftest-x86_64/package.lppkg
+│   └── selftest-aarch64/package.lppkg
+├── linker/
+│   ├── x86_64.ld                    # 1 MiB; .text.boot first; .note.Xen; .idt page-aligned; boot page tables
+│   └── aarch64.ld                   # 0x40080000; .text.boot first; .text.vectors 2 KiB aligned
+├── source/                          # all Loup code; modules import each other by path from here
+│   ├── appinfo.lpfree               # APP_NAME, APP_VERSION, STATUS_*
+│   ├── main_x86_64.lpfree           # kernelMain of the x86_64 scheduler
+│   ├── main_aarch64.lpfree          # kernelMain of the aarch64 scheduler
+│   ├── selftest_x86_64.lpfree       # kernelMain of the x86_64 self-test
+│   ├── selftest_aarch64.lpfree      # kernelMain of the aarch64 self-test
+│   ├── kernel/                      # shared by every image
+│   │   ├── platform.lpfree          # interface Platform: what a board does for the scheduler
+│   │   ├── console.lpfree           # attach(put), puts, putDec, putDecWidth, putHex, putCell
+│   │   ├── queue.lpfree             # class Queue[T] over a buffer[T, 8]
+│   │   ├── tasks.lpfree             # Wait, TaskState[W], the task table, stacks and guards
+│   │   ├── sched.lpfree             # RunQueue (@lockOrder(40)), dispatch, clock, preemption, yield/sleep/block/spawn, trace
+│   │   └── sync.lpfree              # Semaphore; mutexes, ItemsLock (20), ConsoleLock (30)
+│   ├── demo/                        # the scheduler images' tasks
+│   │   ├── run.lpfree               # runKernel(board): banner, bring-up, spawn, start
+│   │   ├── workers.lpfree           # producers, consumer, ticker, counter, hog
+│   │   └── monitor.lpfree           # task table, schedule trace, keys
+│   ├── x86/                         # board.lpfree (X86Cpu + QemuPc, panic handler, PVH entry), context, idt, isr, chipset, com1, ports, qemu
+│   ├── arm/                         # board.lpfree (Arm64Cpu + QemuVirt, panic handler, entry), context, vectors, gic, timer, pl011, qemu
+│   └── selftest/tests.lpfree        # the unit tests and their runner
+├── scripts/qemu.sh                  # the QEMU command line for each CPU
+├── tests/
+│   ├── boot.sh                      # boot tests: wait:/send: steps, -icount, transcripts and exit statuses
+│   └── expected/                    # expected transcripts (key-time ticks and counts masked as N)
+├── specs/bare-sched/                # requirements.md, design.md, tasks.md
+├── skills/loup-programmer/          # the Loup skill and its references
+├── .github/workflows/ci.yml         # installs lld, QEMU and Loup, runs `make ci`, uploads the images
+└── build/                           # build output (git-ignored)
 ```
 
 ## Build, run and test
 
-Prerequisites: Loup 1.26.0 (`loup` and `loup-bootstrap` on `PATH`), `make`,
-and `clang` 17 or later for native builds.
+Prerequisites: Linux x86-64, Loup 1.26.0 (`loup` and `loup-bootstrap` on
+`PATH`), `make`, `clang`, `ld.lld`, `qemu-system-x86_64` and
+`qemu-system-aarch64`.
 
 Loup Lite comes from <https://github.com/code-craft-ai-company/loup-releases>;
 [README.md](README.md#installing-loup-lite) has the install commands.
 
 | Task | Command | Notes |
 |------|---------|-------|
-| Run from source | `make run ARGS="hello Ann --shout"` | `loup run source/main.loup -- ARGS` |
-| Type-check | `make check` | checks `source/main.loup` and every module it imports; tests are not checked |
-| Run all tests | `make test` | every `tests/*_test.loup` |
-| Run matching tests | `make test TEST_ARGS="--filter value"` | tests whose name contains `value` |
-| Run one test file | `make test TEST_ARGS="--file tests/args_test.loup"` | |
-| Build | `make build` | native binary at `build/myapp` |
-| Run the binary | `build/myapp --help` | |
-| Everything CI runs | `make ci` | check, test, build, then `build/myapp --version` |
-| Clean | `make clean` | removes `build/` and `.temp/` |
+| Type-check | `make check` | all four images; one expected frame warning per interrupt handler |
+| Build | `make build` | `build/sched-{x86_64,aarch64}.elf`, `build/selftest-{x86_64,aarch64}.elf` |
+| Build one image | `make build/sched-aarch64.elf` | |
+| Boot tests | `make boot` | `tests/boot.sh`: six cases, a few seconds (QEMU runs with `-icount`) |
+| Refresh expected transcripts | `UPDATE=1 bash tests/boot.sh` | then read `git diff tests/expected` before committing |
+| Use the scheduler | `make run` / `make run ARCH=aarch64` | keys go to the kernel; `q` quits |
+| Everything CI runs | `make ci` | check, build, boot |
+| Clean | `make clean` | removes `build/` and the `.temp/` directories |
 
-Run `make ci` before reporting a change as done. `loup run` and the native
-build do not support the same things, so a change can pass `make test` and
-still fail `make build`.
-
-Do not call `loup test` or `loup check` directly on Linux x86-64. There `loup`
-is the self-hosted driver: it refuses `check`, and its test runner cannot
-resolve this project's imports. The Makefile uses `loup-bootstrap` (Stage0) for
-both, and sets `LOUPPATH=source` for tests.
+Run `make ci` before reporting a change as done. `loup-bootstrap check`
+accepts things the freestanding back ends reject or miscompile, so only a
+boot proves a change. Do not call `loup check` on Linux x86-64 (the
+self-hosted driver refuses it).
 
 ## Making a change
 
-1. Write or update the spec in `specs/<feature>/` (see [specs/README.md](specs/README.md)).
-2. Change the code under `source/`.
-3. Add or update tests in `tests/`.
-4. Run `make ci`.
-5. Tick the finished tasks in `specs/<feature>/tasks.md`.
-
-To add a command:
-
-1. Create `source/commands/<name>.loup` with `@mode(host.dual)` and
-   `pub func run_<name>(opts: Options): int`, returning an exit status from
-   `appinfo`.
-2. Add an arm for it to `dispatch` in `source/cli/app.loup`.
-3. Describe it in `usage()` in `source/cli/usage.loup`.
-4. Add any new options to `Options` and `parse_args` in `source/cli/args.loup`.
-5. Add `tests/<name>_test.loup`.
+1. Update the spec in `specs/bare-sched/`.
+2. Change the code under `source/` (or `linker/`).
+3. Add a self-test to `source/selftest/tests.lpfree` for logic that can be
+   checked without switching tasks, or a case at the end of
+   `tests/boot.sh`.
+4. Run `make build`, then `UPDATE=1 bash tests/boot.sh`, read the diff of
+   `tests/expected/`, then `make ci`. The overflow transcripts contain the
+   line of `unreachable` in `stackOverflow` (kernel/sched.lpfree): a line
+   added above it changes them, and the README quotes them.
+5. Tick the finished tasks in `specs/bare-sched/tasks.md`.
 
 ## Conventions
 
-- Every source file is `@mode(host.dual)` with the `.loup` extension. Only
-  `source/main.loup` has a `main()`.
-- Modules import each other by path from `source/`:
-  `from cli.args import (Options);`. Tests import them the same way. Do not
-  use relative imports (`from .args import ...`): the self-hosted `loup run`
-  on Linux x86-64 fails on them.
-- Struct fields read from another module must be `pub`.
-- The native build supports less than `loup run` does. For example,
-  `list.is_empty()` fails native codegen (`E-CODEGEN-UNHANDLED-METHOD`); use
-  `len() == 0`.
-- Keep `APP_VERSION` in `source/appinfo.loup` equal to `version` in
-  `package.lppkg`.
-- The skill's examples use the `loup init` layout (`src/`, `tests/`, and
-  `from ..src.x import` in tests). This project uses `source/` and
-  `tests/` with plain imports; follow this file.
-- The skill documents toolchain 1.25.1; this template targets 1.26.0. When
+- Every source file is `@mode(freestanding)` with the `.lpfree` extension.
+  Each board module (`x86/board.lpfree`, `arm/board.lpfree`) has the single
+  `@entry` (`_start`); `_start` calls `kernelMain`, which each entry file
+  defines.
+- Code that differs per CPU lives in `source/x86/` and `source/arm/`;
+  `source/kernel/`, `source/demo/` and `source/selftest/` must build for
+  both. The kernel reaches the board only through `Platform`.
+- A template foundation and its overlay stay in one module: across modules
+  the 1.26.0 freestanding build fails (E0107).
+- Every switch happens in `dispatch()` with interrupts masked. Task-side
+  code masks with `irqSaveDisable()`/`irqRestore()` (or `InterruptGuard` in
+  `kernel/sync.lpfree`); interrupt handlers are masked already. Calls into
+  `RunQueue` always happen masked: its lock would deadlock against a
+  handler otherwise.
+- Interrupt handlers call only `@interruptSafe` functions, acknowledge
+  their interrupt first and call `preemptIfNeeded()` last.
+- Lock ranks: items 20, console 30, run queue 40. A new lock gets a class
+  of its own with `@lockOrder(n)`.
+- An aggregate local (a buffer, a struct) is one static block per function
+  unless it is `onstack`: in code that two tasks can run at once, or that
+  keeps the local across a yield, sleep or block, declare it `onstack`.
+- Functions returning an enum with a payload or an `Option` keep the value
+  in a static block: read it at once.
+- Queues hold scalars, and the task table stores states as integers: a
+  buffer of structs or of enums with payloads holds references in 1.26.0
+  freestanding builds. `==` on enum values with a payload is always false:
+  compare with `match`.
+- Raw memory access (`bufGetU64`, `bufSetU64`) needs an `@unsafe` function
+  or an `unsafe("...")` region (`rawpoke = "unsafe-only"`).
+- A `const func` cannot be imported in 1.26.0, and Stage0's const evaluator
+  refuses parenthesized expressions and imported constants as arguments:
+  keep layout checks module-local.
+- `make build` removes `build/*.elf.loupbuild.fp` before each image: the
+  self-hosted build cache does not see changes under `source/` for the
+  manifests in `boards/`.
+- Sized integers (`uint8` ... `uint32`) do not wrap in 1.26.0 freestanding
+  builds; compute in `uint64` and mask when wrap-around matters.
+- `spawn` is a keyword: the kernel's function is `spawnTask`.
+- Keep `APP_VERSION` in `source/appinfo.lpfree` equal to `version` in the
+  four manifests.
+- The skill documents toolchain 1.25.1; this repository targets 1.26.0. When
   they disagree, trust the toolchain's behaviour.

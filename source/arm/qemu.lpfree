@@ -1,0 +1,38 @@
+@mode(freestanding)
+
+# Leaving QEMU on aarch64: semihosting SYS_EXIT. scripts/qemu.sh starts
+# QEMU with -semihosting, so the semihosting call below makes QEMU exit with
+# the status in the block it points to.
+#
+# Runtime: freestanding, aarch64 only. The arm board module imports it, so
+# `make build` compiles it into build/sched-aarch64.elf and
+# build/selftest-aarch64.elf (`loup build --target freestanding --arch
+# aarch64 boards/...`); the x86_64 images never contain it. It runs when
+# `make boot` boots those images on QEMU's virt machine (Cortex-A53);
+# `make check` type-checks it with Stage0 from boards/aarch64.
+
+# The parameter block: the reason (ADP_Stopped_ApplicationExit) and the
+# status.
+var exitBlock: buffer[uint64, 2];
+
+## Exits with QEMU status 0, 1 or 2 for STATUS_OK, STATUS_TEST_FAILED and
+## STATUS_PANIC. Without -semihosting the call traps; the loop below is
+## where the CPU stays.
+@interruptSafe
+pub func qemuExit(status: uint8): void {
+    exitBlock[0] = 0x20026u64;
+    exitBlock[1] = status as uint64;
+    let block = addressOf(exitBlock);
+    asm {
+        # w0 = 0x18, SYS_EXIT; x1 = the block. The semihosting trap is
+        # hlt #0xf000, written as its encoding (llbe does not take the
+        # mnemonic with an immediate).
+        "mov w0, #0x18"
+        ".inst 0xd45e0000"
+        in: "x1" = block
+        clobbers: ["x0", "memory"]
+    }
+    while (true) {
+        asm { "wfi" }
+    }
+}

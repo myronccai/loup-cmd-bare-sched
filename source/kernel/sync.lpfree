@@ -1,0 +1,185 @@
+@mode(freestanding)
+
+# Synchronization between tasks: counting semaphores, and mutexes ranked
+# for deadlock-free nesting.
+#
+# Runtime: freestanding, shared by both scheduler images and both self-test
+# images. `make build` compiles it into each with `loup build --target
+# freestanding`: no operating system, runtime library, heap or exceptions.
+# It runs when `make boot` boots the images under QEMU; the self-test
+# images check the counting without blocking. `make check` type-checks it
+# with Stage0, which also checks the lock order.
+#
+# Structure: semaphores, then mutexes: their state, the lock and unlock
+# operations, and the ranked lock classes tasks use.
+#
+# Both block the calling task in the scheduler and wake the longest waiter
+# first. A wake-up hands the unit (or the mutex) straight to the woken task,
+# so a task that arrives later cannot take it first. Every operation runs
+# with interrupts masked (InterruptGuard): a task can be preempted by the
+# timer only if it runs at background priority, but the guard keeps the
+# check and the block one step whoever calls.
+#
+# Lock ranks, lowest taken first (the compiler rejects any other nesting):
+#   20 ItemsLock    the producers' and consumer's queue
+#   30 ConsoleLock  whole lines on the serial console
+#   40 RunQueue     the scheduler's ready queues (kernel/sched.lpfree)
+
+from kernel.tasks import (Wait, CODE_SEMAPHORE, CODE_MUTEX);
+from kernel.sched import (currentTask, block, wakeLongestWaiter);
+
+# ---- Semaphores -------------------------------------------------------------------
+
+const MAX_SEMAPHORES: int = 4;
+
+var semaphoreNames: buffer[string, 4];
+var semaphoresOpened: int = 0;
+
+## A counting semaphore. Declare it as a module variable and open it once:
+## `var free: Semaphore;` ... `safe { free.open("free", 4u64); }`.
+pub class Semaphore {
+    var id: uint64 = 0u64;
+    var count: uint64 = 0u64;
+
+    ## Names the semaphore (for the task table) and sets its count.
+    pub modifier func open(name: string, initial: uint64): void {
+        if (semaphoresOpened == MAX_SEMAPHORES) {
+            unreachable;
+        }
+        this.id = semaphoresOpened as uint64;
+        semaphoreNames[semaphoresOpened] = name;
+        semaphoresOpened += 1;
+        this.count = initial;
+    }
+
+    pub func value(): uint64 {
+        return this.count;
+    }
+
+    ## Takes one unit, blocking while there is none.
+    pub modifier func down(): void {
+        with (g = InterruptGuard.disable()) {
+            if (this.count > 0u64) {
+                this.count -= 1u64;
+            } else {
+                block(Wait.Semaphore(this.id));
+            }
+        }
+    }
+
+    ## Takes one unit if there is one; never blocks.
+    pub modifier func tryDown(): bool {
+        var taken = false;
+        with (g = InterruptGuard.disable()) {
+            if (this.count > 0u64) {
+                this.count -= 1u64;
+                taken = true;
+            }
+        }
+        return taken;
+    }
+
+    ## Returns one unit: to the longest waiter if a task waits, else to the
+    ## count.
+    pub modifier func up(): void {
+        with (g = InterruptGuard.disable()) {
+            if (wakeLongestWaiter(CODE_SEMAPHORE, this.id) < 0) {
+                this.count += 1u64;
+            }
+        }
+    }
+}
+
+pub func semaphoreName(id: uint64): string {
+    return semaphoreNames[id as int];
+}
+
+# ---- Mutexes -----------------------------------------------------------------------
+
+pub const MUTEX_ITEMS: int = 0;
+pub const MUTEX_CONSOLE: int = 1;
+
+# The owner of each mutex as a task id + 1 (0 = free), and how many times a
+# task found it taken and had to wait.
+var owners: buffer[uint64, 2];
+var contended: buffer[uint64, 2];
+
+pub func mutexName(m: uint64): string {
+    if (m == MUTEX_ITEMS as uint64) {
+        return "items";
+    }
+    return "console";
+}
+
+pub func mutexOwner(m: int): int {
+    return (owners[m] as int) - 1;
+}
+
+pub func mutexWaits(m: int): uint64 {
+    return contended[m];
+}
+
+# A mutex is not recursive, and only its owner may unlock it: either
+# mistake is a bug in a task, so it panics.
+func lockMutex(m: int): void {
+    with (g = InterruptGuard.disable()) {
+        let me = (currentTask() as uint64) + 1u64;
+        if (owners[m] == me) {
+            unreachable;
+        }
+        if (owners[m] == 0u64) {
+            owners[m] = me;
+        } else {
+            contended[m] += 1u64;
+            # unlockMutex makes this task the owner before waking it.
+            block(Wait.Mutex(m as uint64));
+        }
+    }
+}
+
+func unlockMutex(m: int): void {
+    with (g = InterruptGuard.disable()) {
+        if (owners[m] != (currentTask() as uint64) + 1u64) {
+            unreachable;
+        }
+        let next = wakeLongestWaiter(CODE_MUTEX, m as uint64);
+        if (next < 0) {
+            owners[m] = 0u64;
+        } else {
+            owners[m] = (next as uint64) + 1u64;
+        }
+    }
+}
+
+# The lock classes. Ranks belong to classes, so each mutex has a class of
+# its own; the instances below are the locks. Because they carry
+# @lockOrder, the checker treats acquire() and release() as taking and
+# dropping a lock of that rank, in any function.
+
+## The queue the producers and the consumer share.
+@lockOrder(20)
+pub class ItemsLock {
+    pub func acquire(): void {
+        lockMutex(MUTEX_ITEMS);
+    }
+
+    pub func release(): void {
+        unlockMutex(MUTEX_ITEMS);
+    }
+}
+
+## The serial console: a task holds it for each line it prints (the
+## monitor, for a whole table), so lines never mix.
+@lockOrder(30)
+pub class ConsoleLock {
+    pub func acquire(): void {
+        lockMutex(MUTEX_CONSOLE);
+    }
+
+    pub func release(): void {
+        unlockMutex(MUTEX_CONSOLE);
+    }
+}
+
+pub var itemsLock: ItemsLock;
+pub var consoleLock: ConsoleLock;

@@ -1,0 +1,62 @@
+@mode(freestanding)
+
+# The scheduler demo's start-up, the same on every board: bring the board
+# up, spawn the tasks, start scheduling.
+#
+# Runtime: freestanding, shared by both scheduler images,
+# build/sched-x86_64.elf and build/sched-aarch64.elf (`loup build --target
+# freestanding`): no operating system, runtime library, heap or
+# exceptions. Each board's kernelMain calls runKernel once, on the boot
+# stack; `make boot` boots each image under QEMU, and `make check`
+# type-checks it with Stage0.
+
+from appinfo import (APP_NAME, APP_VERSION, STATUS_PANIC);
+from kernel.console import (puts, putDec, newline);
+from kernel.platform import (Platform);
+from kernel.tasks import (PRIO_NORMAL, PRIO_BACKGROUND, taskCount, stackBytes);
+from kernel.sched import (TICK_HZ, SpawnError, schedInit, spawnTask, spawnErrorText, runScheduler);
+from demo.workers import (BATCH, setUpWorkers, producer, consumer, ticker, counter);
+from demo.monitor import (monitor);
+
+# Spawned in this order, so that is also the order in which they first run.
+func spawnDemo(): Result[int, SpawnError] {
+    let _monitor = spawnTask("monitor", PRIO_NORMAL, monitor, 0u64)?;
+    let _a = spawnTask("prod-a", PRIO_NORMAL, producer, 1u64)?;
+    let _b = spawnTask("prod-b", PRIO_NORMAL, producer, 10u64)?;
+    let _cons = spawnTask("cons", PRIO_NORMAL, consumer, (2 * BATCH) as uint64)?;
+    let _ticker = spawnTask("ticker", PRIO_NORMAL, ticker, 25u64)?;
+    let _counter = spawnTask("counter", PRIO_BACKGROUND, counter, 0u64)?;
+    return Ok(taskCount());
+}
+
+## Never returns: the boot context becomes the idle task.
+pub func runKernel(board: Platform): void {
+    puts(APP_NAME);
+    puts(" ");
+    puts(APP_VERSION);
+    puts(" on ");
+    puts(board.arch());
+    puts(" (");
+    puts(board.machine());
+    puts(")");
+    newline();
+    board.bringUp();
+    schedInit(board);
+    setUpWorkers();
+    var count = 0;
+    try {
+        count = attempt spawnDemo();
+    } catch Err(e) {
+        puts("sched: cannot start the demo: ");
+        puts(spawnErrorText(e));
+        newline();
+        board.halt(STATUS_PANIC);
+    }
+    puts("sched: ");
+    putDec(count as uint64);
+    puts(" tasks on ");
+    putDec(stackBytes() / 1024u64);
+    puts(" KiB stacks; the timer preempts the background task");
+    newline();
+    runScheduler(TICK_HZ);
+}

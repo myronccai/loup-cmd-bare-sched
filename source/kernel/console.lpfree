@@ -1,0 +1,123 @@
+@mode(freestanding)
+
+# The kernel's console: text and numbers written a byte at a time through
+# the board's UART, which the board attaches at boot.
+#
+# Runtime: freestanding, shared by all four images. `make build` compiles
+# it into each with `loup build --target freestanding`: no operating
+# system, runtime library, heap or exceptions. It runs when `make boot`
+# boots the images under QEMU; `make check` type-checks it with Stage0.
+#
+# Output is polled: each byte waits for the UART, so nothing here blocks a
+# task or needs an interrupt. Tasks serialize whole lines with ConsoleLock
+# (kernel/sync.lpfree); the panic handler writes without it.
+
+func discard(c: uint8): void {
+}
+
+# The board's byte writer (com1Put, pl011Put); the self-test swaps in a
+# capturing writer to check what the formatting functions produce.
+var gPut: fn(uint8): void = discard;
+
+pub func attach(put: fn(uint8): void): void {
+    gPut = put;
+}
+
+pub func putc(c: uint8): void {
+    gPut(c);
+}
+
+pub func puts(s: string): void {
+    for (c in s) {
+        gPut(c as uint8);
+    }
+}
+
+pub func newline(): void {
+    gPut(0x0Au8);
+}
+
+pub func spaces(n: int): void {
+    var left = n;
+    while (left > 0) {
+        gPut(0x20u8);
+        left -= 1;
+    }
+}
+
+## The number of bytes in `s`: its width on the console, since every name
+## and label the kernel prints is ASCII.
+pub func textWidth(s: string): int {
+    var n = 0;
+    for (c in s) {
+        n += 1;
+    }
+    return n;
+}
+
+## `s`, then spaces up to `width` columns (a table cell, left-aligned).
+pub func putCell(s: string, width: int): void {
+    puts(s);
+    spaces(width - textWidth(s));
+}
+
+## The decimal digits of `n`, right-aligned in `width` columns (0 for no
+## padding). The digits are produced lowest first into a frame buffer, then
+## written in reverse. onstack keeps the buffer in the caller's frame: a
+## plain buffer local would be one static block shared by every task that
+## prints. Every local is written before it is read, so the frame is not
+## zeroed first.
+@no_zero_locals
+pub func putDecWidth(n: uint64, width: int): void {
+    onstack var digits: buffer[uint8, 20];
+    var count = 0;
+    var rest = n;
+    do {
+        digits[count] = (0x30u64 + rest % 10u64) as uint8;
+        rest = rest / 10u64;
+        count += 1;
+    } while (rest > 0u64);
+    spaces(width - count);
+    while (count > 0) {
+        count -= 1;
+        gPut(digits[count]);
+    }
+}
+
+## How many digits putDec writes for `n`.
+pub func decimalWidth(n: uint64): int {
+    var width = 1;
+    var rest = n / 10u64;
+    while (rest > 0u64) {
+        width += 1;
+        rest = rest / 10u64;
+    }
+    return width;
+}
+
+pub func putDec(n: uint64): void {
+    putDecWidth(n, 0);
+}
+
+## 0x-prefixed lower-case hex, without leading zeros.
+pub func putHex(n: uint64): void {
+    puts("0x");
+    var shift: uint64 = 60u64;
+    while (shift > 0u64 and ((n >> shift) & 0xFu64) == 0u64) {
+        shift -= 4u64;
+    }
+    var done = false;
+    while (!done) {
+        let nibble = (n >> shift) & 0xFu64;
+        if (nibble < 10u64) {
+            gPut((0x30u64 + nibble) as uint8);
+        } else {
+            gPut((0x57u64 + nibble) as uint8);
+        }
+        if (shift == 0u64) {
+            done = true;
+        } else {
+            shift -= 4u64;
+        }
+    }
+}

@@ -1,0 +1,142 @@
+@mode(freestanding)
+
+# Switching between tasks on x86_64: the context switch, the entry a new
+# task starts at, and the frame that leads a new task there.
+#
+# Runtime: freestanding, x86_64 only. The x86 board module imports it, so
+# `make build` compiles it into build/sched-x86_64.elf and
+# build/selftest-x86_64.elf (`loup build --target freestanding --arch
+# x86_64`); the aarch64 images never contain it. It runs when `make boot`
+# boots those images on QEMU's pc machine; `make check` type-checks it with
+# Stage0.
+#
+# A task that is not running is described entirely by its stack pointer:
+# everything else it needs is on its stack. The switch is an ordinary call
+# as far as the caller is concerned, so it only has to keep what the
+# System V ABI says a call preserves (rbx, rbp, r12-r15 and rsp); the
+# caller has already saved anything else it still needs. The x86_64
+# freestanding back end uses no SSE registers, so there is no
+# floating-point state to save.
+
+## The frame switchContext leaves on a stack, lowest address first: the six
+## preserved registers in the order it pops them, then the address its ret
+## returns to.
+@repr(C)
+struct SwitchFrame {
+    var r15: uint64;
+    var r14: uint64;
+    var r13: uint64;
+    var r12: uint64;
+    var rbx: uint64;
+    var rbp: uint64;
+    var rip: uint64;
+}
+
+## `actual` when it equals `expected`, evaluated by the compiler: if the
+## frame and the pushes below disagree, the build fails.
+const func checkedSize(actual: uint64, expected: uint64): uint64 {
+    if (actual != expected) {
+        unreachable;
+    }
+    return actual;
+}
+
+const FRAME_BYTES = checkedSize(size_of[SwitchFrame](), 56u64);
+const FRAME_WORDS: int = 7;
+
+## switchContext(saveSpAt, nextSp): saves the running task and resumes
+## another. The arguments arrive as System V says (rdi, rsi): a naked
+## function has no prologue to move them, so the assembly reads the
+## registers, and @callconv makes the convention part of the declaration.
+## Called with interrupts masked (from dispatch in kernel/sched.lpfree).
+@naked
+@callconv("sysv64")
+@interruptSafe
+@unsafe("naked: replaces rsp; saves and restores the System V callee-saved registers on the two task stacks")
+@section(".text.switch")
+pub func switchContext(saveSpAt: uint64, nextSp: uint64): void {
+    asm {
+        # The call that got here pushed the return address into the
+        # caller: that address is where this task resumes.
+        # Save the callee-saved registers on the running task's stack,
+        # in the reverse of SwitchFrame's order.
+        "push rbp"
+        "push rbx"
+        "push r12"
+        "push r13"
+        "push r14"
+        "push r15"
+        # The stack now ends in a SwitchFrame. Its address is all that is
+        # needed to resume the task: store it where the scheduler keeps it.
+        "mov [rdi], rsp"
+        # Take the other task's stack: it ends in the SwitchFrame its own
+        # switch (or newTaskFrame) left there.
+        "mov rsp, rsi"
+        # Restore its registers ...
+        "pop r15"
+        "pop r14"
+        "pop r13"
+        "pop r12"
+        "pop rbx"
+        "pop rbp"
+        # ... and return to where it called switchContext: or, for a new
+        # task, to taskEntry.
+        "ret"
+    }
+}
+
+## Where a new task's first switch returns to: the frame newTaskFrame built
+## holds the task id in r12. Interrupts are still masked from the switch.
+@naked
+@callconv("sysv64")
+@unsafe("naked: runs with the frame newTaskFrame built; never returns")
+@section(".text.switch")
+func taskEntry(): void {
+    asm {
+        # Every task runs with interrupts enabled.
+        "sti"
+        # taskStart(id): the first argument goes in rdi.
+        "mov rdi, r12"
+        # rsp is 16-byte aligned here, as a call requires (newTaskFrame).
+        "call taskStart"
+        # taskStart ends the task and never returns: trap if it ever does.
+        "ud2"
+    }
+}
+
+func taskEntryAddress(): uint64 {
+    var a: uint64 = 0u64;
+    asm { "lea rax, [rip + taskEntry]" out: a = "=a" clobbers: [] }
+    return a;
+}
+
+## Builds a new task's first SwitchFrame below `stackTop` and returns the
+## stack pointer the switch resumes it from. PartialInit makes the compiler
+## check that every register gets a value: a frame with a field left out
+## would start the task with whatever the stack held.
+@unsafe("raw stack memory: writes the first frame into a task's stack, reserved by makeBufferU64")
+pub func newTaskFrame(stackTop: uint64, taskId: uint64): uint64 {
+    var f = PartialInit[SwitchFrame].begin();
+    f.set(.r15, 0u64);
+    f.set(.r14, 0u64);
+    f.set(.r13, 0u64);
+    f.set(.r12, taskId);
+    f.set(.rbx, 0u64);
+    f.set(.rbp, 0u64);
+    f.set(.rip, taskEntryAddress());
+    let frame = f.complete();
+    # After the switch pops the frame, rsp is sp + FRAME_BYTES; place the
+    # frame so that this is 16-byte aligned for taskEntry's call, with a
+    # spare word above it.
+    let top = stackTop - (stackTop % 16u64);
+    let sp = top - 16u64 - FRAME_BYTES;
+    bufSetU64(sp, 0, frame.r15);
+    bufSetU64(sp, 1, frame.r14);
+    bufSetU64(sp, 2, frame.r13);
+    bufSetU64(sp, 3, frame.r12);
+    bufSetU64(sp, 4, frame.rbx);
+    bufSetU64(sp, 5, frame.rbp);
+    bufSetU64(sp, 6, frame.rip);
+    bufSetU64(sp, FRAME_WORDS, 0u64);
+    return sp;
+}

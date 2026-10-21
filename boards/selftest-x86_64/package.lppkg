@@ -1,0 +1,25 @@
+# The x86_64 self-test image: the kernel's unit tests, booted by
+# `make boot`. Build it with
+#   loup build --target freestanding --arch x86_64 boards/selftest-x86_64
+# Paths are relative to this directory.
+name = "selftest"
+version = "0.1.0"
+loup = "1.26.0"
+authors = []
+
+[build]
+entry = "../../source/selftest_x86_64.lpfree"
+target = "freestanding"
+mode = "freestanding"
+arch = "x86_64"
+panic = "custom"
+
+[linker]
+script = "../../linker/x86_64.ld"
+entry = "_start"
+
+[freestanding]
+stack_size = 65536
+bounds = "trap"
+overlays = "error"
+rawpoke = "unsafe-only"

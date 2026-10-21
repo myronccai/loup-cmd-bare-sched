@@ -1,0 +1,26 @@
+@mode(freestanding)
+
+# The x86_64 self-test image: runs the kernel's unit tests
+# (selftest/tests.lpfree) on the bare machine and reports through COM1.
+#
+# Runtime: freestanding, x86_64 only. The entry file of
+# boards/selftest-x86_64/package.lppkg: `make build` compiles it, with the
+# modules under test and the x86 board, into build/selftest-x86_64.elf
+# (`loup build --target freestanding --arch x86_64
+# boards/selftest-x86_64`). `make boot` boots it on QEMU's pc machine and
+# compares the report with tests/expected/selftest-x86_64.txt; QEMU exits
+# with 33 when every test passes, 35 when one fails. `make check`
+# type-checks it with Stage0.
+
+from kernel.console import (attach);
+from x86.com1 import (com1Init, com1Put);
+from x86.board import (pcBoard);
+from selftest.tests import (runAll);
+
+# Called by name from _start (x86/board.lpfree), as in the scheduler image.
+func kernelMain(): void {
+    com1Init();
+    attach(com1Put);
+    let board = pcBoard();
+    board.halt(runAll(board, com1Put));
+}
